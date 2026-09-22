@@ -1,0 +1,188 @@
+{
+  "title": "마중 운영 현황",
+  "description": "마중 서비스의 Kubernetes 로그량, 경고·오류, 서비스와 파드 분포를 확인하는 운영 대시보드",
+  "time_range": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "grid": {"x": 0, "y": 0, "w": 12, "h": 5},
+      "type": "vis",
+      "config": {
+        "type": "metric",
+        "title": "전체 로그",
+        "description": "선택한 시간 범위의 유효 로그 이벤트 수",
+        "data_source": {
+          "type": "esql",
+          "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND NOT (service == \"web\" AND message LIKE \"*kube-probe*\") | STATS logs = COUNT()"
+        },
+        "metrics": [
+          {"type": "primary", "column": "logs", "label": "로그 이벤트"}
+        ]
+      }
+    },
+    {
+      "grid": {"x": 12, "y": 0, "w": 12, "h": 5},
+      "type": "vis",
+      "config": {
+        "type": "metric",
+        "title": "경고·오류",
+        "description": "알려진 Kibana 반복 경고를 제외한 WARN, ERROR, 예외 및 stderr 수",
+        "data_source": {
+          "type": "esql",
+          "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND (message LIKE \"*ERROR*\" OR message LIKE \"*WARN*\" OR message LIKE \"*Exception*\" OR stream == \"stderr\") AND message NOT LIKE \"*No API key found in saved object*\" AND message NOT LIKE \"*load prerelease flag*\" | STATS issues = COUNT()"
+        },
+        "metrics": [
+          {"type": "primary", "column": "issues", "label": "확인 필요"}
+        ]
+      }
+    },
+    {
+      "grid": {"x": 24, "y": 0, "w": 12, "h": 5},
+      "type": "vis",
+      "config": {
+        "type": "metric",
+        "title": "활성 서비스",
+        "description": "선택한 시간 범위에 로그를 남긴 서비스 수",
+        "data_source": {
+          "type": "esql",
+          "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" | STATS events = COUNT() BY service | STATS active_services = COUNT()"
+        },
+        "metrics": [
+          {"type": "primary", "column": "active_services", "label": "활성 서비스"}
+        ]
+      }
+    },
+    {
+      "grid": {"x": 36, "y": 0, "w": 12, "h": 5},
+      "type": "vis",
+      "config": {
+        "type": "metric",
+        "title": "실사용 웹 요청",
+        "description": "Kubernetes 헬스 체크를 제외한 웹 요청 수",
+        "data_source": {
+          "type": "esql",
+          "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service == \"web\" AND message NOT LIKE \"*kube-probe*\" | STATS requests = COUNT()"
+        },
+        "metrics": [
+          {"type": "primary", "column": "requests", "label": "웹 요청"}
+        ]
+      }
+    },
+    {
+      "grid": {"x": 0, "y": 5, "w": 32, "h": 14},
+      "type": "vis",
+      "config": {
+        "type": "xy",
+        "title": "서비스별 로그 추이",
+        "description": "수집기 자체 로그와 웹 헬스 체크를 제외한 서비스별 이벤트 흐름",
+        "layers": [
+          {
+            "type": "line",
+            "data_source": {
+              "type": "esql",
+              "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND NOT (service == \"web\" AND message LIKE \"*kube-probe*\") | STATS logs = COUNT() BY bucket = BUCKET(@timestamp, 50, ?_tstart, ?_tend), service | SORT bucket ASC"
+            },
+            "x": {"column": "bucket", "label": "시간"},
+            "y": [{"column": "logs", "label": "로그 수"}],
+            "breakdown_by": {"column": "service", "label": "서비스"}
+          }
+        ],
+        "axis": {
+          "x": {"title": {"visible": false}},
+          "y": {"title": {"visible": true, "text": "이벤트"}}
+        },
+        "legend": {"placement": "outside", "position": "right", "visibility": "visible"}
+      }
+    },
+    {
+      "grid": {"x": 32, "y": 5, "w": 16, "h": 14},
+      "type": "vis",
+      "config": {
+        "type": "pie",
+        "title": "서비스별 로그 비중",
+        "description": "수집기 자체 로그와 웹 헬스 체크를 제외한 서비스별 점유율",
+        "data_source": {
+          "type": "esql",
+          "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND NOT (service == \"web\" AND message LIKE \"*kube-probe*\") | STATS logs = COUNT() BY service | SORT logs DESC | LIMIT 10"
+        },
+        "group_by": [{"column": "service", "label": "서비스"}],
+        "metrics": [{"column": "logs", "label": "로그 수"}],
+        "legend": {"position": "right", "visibility": "visible"}
+      }
+    },
+    {
+      "grid": {"x": 0, "y": 19, "w": 24, "h": 12},
+      "type": "vis",
+      "config": {
+        "type": "xy",
+        "title": "경고·오류 추이",
+        "description": "서비스별 WARN, ERROR, 예외 및 stderr 발생 추이",
+        "layers": [
+          {
+            "type": "bar_stacked",
+            "data_source": {
+              "type": "esql",
+              "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND (message LIKE \"*ERROR*\" OR message LIKE \"*WARN*\" OR message LIKE \"*Exception*\" OR stream == \"stderr\") AND message NOT LIKE \"*No API key found in saved object*\" AND message NOT LIKE \"*load prerelease flag*\" | STATS issues = COUNT() BY bucket = BUCKET(@timestamp, 30, ?_tstart, ?_tend), service | SORT bucket ASC"
+            },
+            "x": {"column": "bucket", "label": "시간"},
+            "y": [{"column": "issues", "label": "경고·오류"}],
+            "breakdown_by": {"column": "service", "label": "서비스"}
+          }
+        ],
+        "axis": {"x": {"title": {"visible": false}}},
+        "legend": {"placement": "outside", "position": "bottom", "visibility": "visible"}
+      }
+    },
+    {
+      "grid": {"x": 24, "y": 19, "w": 24, "h": 12},
+      "type": "vis",
+      "config": {
+        "type": "xy",
+        "title": "로그가 많은 파드",
+        "description": "선택한 시간 범위에서 이벤트를 가장 많이 생성한 파드",
+        "layers": [
+          {
+            "type": "bar_horizontal",
+            "data_source": {
+              "type": "esql",
+              "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND NOT (service == \"web\" AND message LIKE \"*kube-probe*\") | STATS logs = COUNT() BY pod | SORT logs DESC | LIMIT 8"
+            },
+            "x": {"column": "pod", "label": "파드"},
+            "y": [{"column": "logs", "label": "로그 수"}]
+          }
+        ],
+        "axis": {"x": {"title": {"visible": false}}},
+        "legend": {"placement": "outside", "position": "bottom", "visibility": "hidden"}
+      }
+    },
+    {
+      "grid": {"x": 0, "y": 31, "w": 48, "h": 16},
+      "type": "vis",
+      "config": {
+        "type": "data_table",
+        "title": "최근 경고·오류",
+        "description": "최신순 최대 50건. 메시지를 확인한 뒤 서비스와 파드 기준으로 원인을 추적하세요.",
+        "data_source": {
+          "type": "esql",
+          "query": "FROM majoong-logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend AND service != \"logstash\" AND (message LIKE \"*ERROR*\" OR message LIKE \"*WARN*\" OR message LIKE \"*Exception*\" OR stream == \"stderr\") AND message NOT LIKE \"*No API key found in saved object*\" AND message NOT LIKE \"*load prerelease flag*\" | SORT @timestamp DESC | KEEP @timestamp, service, pod, message | LIMIT 50"
+        },
+        "rows": [
+          {"column": "@timestamp", "label": "발생 시각", "width": 190},
+          {"column": "service", "label": "서비스", "width": 140},
+          {"column": "pod", "label": "파드", "width": 220},
+          {"column": "message", "label": "메시지", "width": 640}
+        ],
+        "styling": {"density": {"mode": "compact"}}
+      }
+    },
+    {
+      "grid": {"x": 0, "y": 47, "w": 48, "h": 5},
+      "type": "markdown",
+      "config": {
+        "content": "### 운영 팁\n\n상단 시간 범위를 바꾸면 모든 지표가 함께 갱신됩니다. 원문 전체 검색은 [Discover](/majoong-monitor/app/discover)에서 확인하고, 실제 서비스는 [마중구름](/majoong/)에서 점검하세요. 로그는 7일 후 자동 삭제됩니다."
+      }
+    }
+  ]
+}

@@ -8,4 +8,6 @@ LIVE 모드는 Kubernetes `icn-api-key` Secret의 `serviceKey`를 사용하며, 
 
 Vector가 `majoong-dev` 네임스페이스 로그를 Redis DB 1의 `logs:majoong:v1` 리스트에 JSON으로 기록합니다. Logstash가 이 리스트를 FIFO로 소비해 `majoong-logs-YYYY.MM.dd` Elasticsearch 인덱스로 적재하고, Kibana는 `https://maru4737.duckdns.org/majoong-monitor/`에서 제공합니다. 인덱스 수명주기 정책은 로그를 7일 후 삭제합니다.
 
+`마중 운영 현황` 대시보드는 전체 로그, 경고·오류, 활성 서비스, 실사용 웹 요청, 서비스·파드별 추이와 최신 오류 표를 최근 30분 기준으로 제공합니다. 정의는 `deploy/kibana/majoong-operations-dashboard.json`에 있으며 `make monitoring`으로 ConfigMap과 Elastic Stack 설정을 함께 반영합니다.
+
 Elastic Stack 배포 설정은 `deploy/k8s/elk.yaml`, 443 프록시와 Basic 인증 경로는 `deploy/k8s/majoong-proxy.conf`에 있습니다. 실제 인증키와 암호는 Git에 저장하지 않습니다.

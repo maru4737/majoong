@@ -200,6 +200,7 @@ data:
     view_id=$(printf '%s' "$response" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
     test -n "$view_id"
     curl -fsS -X POST "$KB/api/data_views/default" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "{\"data_view_id\":\"$view_id\",\"force\":true}" >/dev/null
+    curl -fsS -X PUT "$KB/api/dashboards/majoong-operations" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' --data-binary @/dashboard/dashboard.json >/dev/null
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -222,9 +223,13 @@ spec:
             image: curlimages/curl:8.12.1
             imagePullPolicy: IfNotPresent
             command: ["/bin/sh", "/scripts/bootstrap.sh"]
-            volumeMounts: [{name: script, mountPath: /scripts, readOnly: true}]
+            volumeMounts:
+            - {name: script, mountPath: /scripts, readOnly: true}
+            - {name: dashboard, mountPath: /dashboard, readOnly: true}
             resources: {requests: {cpu: 5m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
             securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsNonRoot: true, runAsUser: 100, runAsGroup: 101}
           volumes:
           - name: script
             configMap: {name: elastic-stack-bootstrap, defaultMode: 0555}
+          - name: dashboard
+            configMap: {name: kibana-dashboard}
