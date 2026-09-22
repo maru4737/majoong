@@ -1,0 +1,230 @@
+apiVersion: v1
+kind: Service
+metadata: {name: elasticsearch, namespace: majoong-dev}
+spec:
+  selector: {app: elasticsearch}
+  ports: [{name: http, port: 9200, targetPort: 9200}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: elasticsearch, namespace: majoong-dev}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: elasticsearch}}
+  template:
+    metadata: {labels: {app: elasticsearch}}
+    spec:
+      initContainers:
+      - name: prepare-elasticsearch-data
+        image: busybox:1.37
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown -R 1000:0 /usr/share/elasticsearch/data"]
+        securityContext: {runAsUser: 0}
+        volumeMounts: [{name: data, mountPath: /usr/share/elasticsearch/data}]
+      containers:
+      - name: elasticsearch
+        image: docker.elastic.co/elasticsearch/elasticsearch:9.5.4
+        imagePullPolicy: IfNotPresent
+        env:
+        - {name: discovery.type, value: single-node}
+        - {name: cluster.name, value: majoong-logs}
+        - {name: node.name, value: majoong-es-01}
+        - {name: xpack.security.enabled, value: "false"}
+        - {name: xpack.security.enrollment.enabled, value: "false"}
+        - {name: xpack.ml.enabled, value: "false"}
+        - {name: ES_JAVA_OPTS, value: "-Xms1g -Xmx1g"}
+        ports: [{name: http, containerPort: 9200}, {name: transport, containerPort: 9300}]
+        volumeMounts: [{name: data, mountPath: /usr/share/elasticsearch/data}]
+        resources: {requests: {cpu: 250m, memory: 1280Mi}, limits: {cpu: "2", memory: 2Gi}}
+        startupProbe: {httpGet: {path: /_cluster/health, port: http}, periodSeconds: 5, failureThreshold: 90}
+        readinessProbe: {httpGet: {path: /_cluster/health, port: http}, periodSeconds: 10}
+        livenessProbe: {httpGet: {path: /, port: http}, initialDelaySeconds: 60, periodSeconds: 20}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsUser: 1000, runAsGroup: 0}
+      securityContext: {fsGroup: 1000, fsGroupChangePolicy: OnRootMismatch}
+      volumes:
+      - name: data
+        hostPath: {path: /var/lib/majoong-elasticsearch, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: logstash-config, namespace: majoong-dev}
+data:
+  logstash.yml: |
+    api.http.host: 0.0.0.0
+    xpack.monitoring.enabled: false
+    queue.type: persisted
+    queue.max_bytes: 256mb
+    pipeline.workers: 1
+    pipeline.batch.size: 50
+  majoong.conf: |
+    input {
+      redis {
+        host => "redis"
+        port => 6379
+        db => 1
+        key => "logs:majoong:v1"
+        data_type => "list"
+        password => "${REDIS_PASSWORD}"
+        batch_count => 100
+        codec => json
+      }
+    }
+    filter {
+      if [timestamp] {
+        date { match => ["timestamp", "ISO8601"] target => "@timestamp" }
+      }
+      mutate { add_field => { "ingested_by" => "logstash" } }
+    }
+    output {
+      elasticsearch {
+        hosts => ["http://elasticsearch:9200"]
+        index => "majoong-logs-%{+YYYY.MM.dd}"
+        ilm_enabled => false
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata: {name: logstash, namespace: majoong-dev}
+spec:
+  selector: {app: logstash}
+  ports: [{name: api, port: 9600, targetPort: 9600}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: logstash, namespace: majoong-dev}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: logstash}}
+  template:
+    metadata: {labels: {app: logstash}}
+    spec:
+      initContainers:
+      - name: wait-for-elasticsearch
+        image: busybox:1.37
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "until wget -q -O- http://elasticsearch:9200/_cluster/health >/dev/null; do sleep 3; done; chown -R 1000:0 /usr/share/logstash/data"]
+        securityContext: {runAsUser: 0}
+        volumeMounts: [{name: data, mountPath: /usr/share/logstash/data}]
+      containers:
+      - name: logstash
+        image: docker.elastic.co/logstash/logstash:9.5.4
+        imagePullPolicy: IfNotPresent
+        env:
+        - {name: LS_JAVA_OPTS, value: "-Xms384m -Xmx384m"}
+        - name: REDIS_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+        ports: [{name: api, containerPort: 9600}]
+        volumeMounts:
+        - {name: settings, mountPath: /usr/share/logstash/config/logstash.yml, subPath: logstash.yml, readOnly: true}
+        - {name: pipeline, mountPath: /usr/share/logstash/pipeline, readOnly: true}
+        - {name: data, mountPath: /usr/share/logstash/data}
+        resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {cpu: "1", memory: 896Mi}}
+        startupProbe: {tcpSocket: {port: api}, periodSeconds: 5, failureThreshold: 90}
+        readinessProbe: {tcpSocket: {port: api}, periodSeconds: 10}
+        livenessProbe: {tcpSocket: {port: api}, initialDelaySeconds: 60, periodSeconds: 20}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsUser: 1000, runAsGroup: 0}
+      securityContext: {fsGroup: 1000, fsGroupChangePolicy: OnRootMismatch}
+      volumes:
+      - name: settings
+        configMap:
+          name: logstash-config
+          items: [{key: logstash.yml, path: logstash.yml}]
+      - name: pipeline
+        configMap:
+          name: logstash-config
+          items: [{key: majoong.conf, path: majoong.conf}]
+      - name: data
+        hostPath: {path: /var/lib/majoong-logstash, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kibana, namespace: majoong-dev}
+spec:
+  type: NodePort
+  selector: {app: kibana}
+  ports: [{name: http, port: 5601, targetPort: 5601, nodePort: 32561}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: kibana, namespace: majoong-dev}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: kibana}}
+  template:
+    metadata: {labels: {app: kibana}}
+    spec:
+      containers:
+      - name: kibana
+        image: docker.elastic.co/kibana/kibana:9.5.4
+        imagePullPolicy: IfNotPresent
+        env:
+        - {name: ELASTICSEARCH_HOSTS, value: "http://elasticsearch:9200"}
+        - {name: SERVER_HOST, value: "0.0.0.0"}
+        - {name: SERVER_BASEPATH, value: "/majoong-monitor"}
+        - {name: SERVER_REWRITEBASEPATH, value: "true"}
+        - {name: SERVER_PUBLICBASEURL, value: "https://maru4737.duckdns.org/majoong-monitor"}
+        - {name: XPACK_SECURITY_ENABLED, value: "false"}
+        - {name: TELEMETRY_ENABLED, value: "false"}
+        - {name: NODE_OPTIONS, value: "--max-old-space-size=896"}
+        - name: XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY
+          valueFrom: {secretKeyRef: {name: kibana-encryption-keys, key: savedObjects}}
+        - name: XPACK_REPORTING_ENCRYPTIONKEY
+          valueFrom: {secretKeyRef: {name: kibana-encryption-keys, key: reporting}}
+        - name: XPACK_SECURITY_ENCRYPTIONKEY
+          valueFrom: {secretKeyRef: {name: kibana-encryption-keys, key: security}}
+        ports: [{name: http, containerPort: 5601}]
+        resources: {requests: {cpu: 150m, memory: 768Mi}, limits: {cpu: "1", memory: 1536Mi}}
+        startupProbe: {httpGet: {path: /majoong-monitor/api/status, port: http}, periodSeconds: 5, failureThreshold: 120}
+        readinessProbe: {httpGet: {path: /majoong-monitor/api/status, port: http}, periodSeconds: 10}
+        livenessProbe: {httpGet: {path: /majoong-monitor/api/status, port: http}, initialDelaySeconds: 90, periodSeconds: 20}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsUser: 1000, runAsGroup: 0}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: elastic-stack-bootstrap, namespace: majoong-dev}
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    set -eu
+    ES=http://elasticsearch:9200
+    KB=http://kibana:5601/majoong-monitor
+    until curl -fsS "$ES/_cluster/health" >/dev/null; do sleep 3; done
+    curl -fsS -X PUT "$ES/_ilm/policy/majoong-logs-7-days" -H 'Content-Type: application/json' -d '{"policy":{"phases":{"hot":{"actions":{}},"delete":{"min_age":"7d","actions":{"delete":{}}}}}}' >/dev/null
+    curl -fsS -X PUT "$ES/_index_template/majoong-logs-template" -H 'Content-Type: application/json' -d '{"index_patterns":["majoong-logs-*"],"priority":500,"template":{"settings":{"index.lifecycle.name":"majoong-logs-7-days","number_of_shards":1,"number_of_replicas":0},"mappings":{"properties":{"@timestamp":{"type":"date"},"service":{"type":"keyword"},"namespace":{"type":"keyword"},"pod":{"type":"keyword"},"node":{"type":"keyword"},"stream":{"type":"keyword"},"source_type":{"type":"keyword"},"log_schema_version":{"type":"integer"},"message":{"type":"match_only_text"}}}}}' >/dev/null
+    until curl -fsS "$KB/api/status" >/dev/null; do sleep 5; done
+    response=$(curl -fsS -X POST "$KB/api/data_views/data_view" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d '{"data_view":{"title":"majoong-logs-*","name":"마중 운영 로그","timeFieldName":"@timestamp","allowNoIndex":true},"override":true}')
+    view_id=$(printf '%s' "$response" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    test -n "$view_id"
+    curl -fsS -X POST "$KB/api/data_views/default" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "{\"data_view_id\":\"$view_id\",\"force\":true}" >/dev/null
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: elastic-stack-bootstrap, namespace: majoong-dev}
+spec:
+  schedule: "23 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 600
+      backoffLimit: 4
+      template:
+        metadata: {labels: {app: elastic-stack-bootstrap}}
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: bootstrap
+            image: curlimages/curl:8.12.1
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh", "/scripts/bootstrap.sh"]
+            volumeMounts: [{name: script, mountPath: /scripts, readOnly: true}]
+            resources: {requests: {cpu: 5m, memory: 16Mi}, limits: {cpu: 100m, memory: 64Mi}}
+            securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsNonRoot: true, runAsUser: 100, runAsGroup: 101}
+          volumes:
+          - name: script
+            configMap: {name: elastic-stack-bootstrap, defaultMode: 0555}
