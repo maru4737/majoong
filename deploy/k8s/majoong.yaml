@@ -1,0 +1,270 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: majoong-dev}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: majoong-config, namespace: majoong-dev}
+data: {APP_MODE: live}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: majoong-dev}
+spec: {selector: {app: redis}, ports: [{port: 6379, targetPort: 6379}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: majoong-dev}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      initContainers:
+      - name: prepare-redis-directory
+        image: redis:7.4-alpine
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown 999:1000 /data"]
+        securityContext: {runAsUser: 0}
+        volumeMounts: [{name: redis-data, mountPath: /data}]
+      containers:
+      - name: redis
+        image: redis:7.4-alpine
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args: ['exec redis-server --appendonly yes --appendfsync everysec --requirepass "$REDIS_PASSWORD" --databases 16 --maxmemory 256mb --maxmemory-policy allkeys-lru']
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+        ports: [{containerPort: 6379}]
+        volumeMounts: [{name: redis-data, mountPath: /data}]
+        resources: {requests: {cpu: 25m, memory: 64Mi}, limits: {cpu: 250m, memory: 384Mi}}
+        readinessProbe: {exec: {command: ["sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" ping']}, initialDelaySeconds: 3, periodSeconds: 5}
+        livenessProbe: {exec: {command: ["sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" ping']}, initialDelaySeconds: 10, periodSeconds: 10}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsUser: 999, runAsGroup: 1000}
+      volumes:
+      - name: redis-data
+        hostPath: {path: /var/lib/majoong-redis, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: majoong, namespace: majoong-dev}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: journey-service, namespace: majoong-dev}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: journey-service}}
+  template:
+    metadata: {labels: {app: journey-service}}
+    spec:
+      serviceAccountName: majoong
+      initContainers:
+      - name: prepare-data-directory
+        image: eclipse-temurin:21-jre-jammy
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chown 10001:10001 /data"]
+        volumeMounts: [{name: majoong-data, mountPath: /data}]
+      containers:
+      - name: journey-service
+        image: majoong/journey-service:0.3.1
+        imagePullPolicy: Never
+        envFrom: [{configMapRef: {name: majoong-config}}]
+        env:
+        - name: SPRING_DATASOURCE_URL
+          value: jdbc:h2:file:/data/majoong;AUTO_SERVER=TRUE;MODE=PostgreSQL
+        - name: SPRING_DATA_REDIS_HOST
+          value: redis
+        - name: SPRING_DATA_REDIS_PORT
+          value: "6379"
+        - name: SPRING_DATA_REDIS_DATABASE
+          value: "0"
+        - name: SPRING_DATA_REDIS_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+        - name: ICN_SERVICE_KEY
+          valueFrom: {secretKeyRef: {name: icn-api-key, key: serviceKey}}
+        volumeMounts: [{name: majoong-data, mountPath: /data}]
+        ports: [{containerPort: 8080}]
+        resources: {requests: {cpu: 150m, memory: 256Mi}, limits: {cpu: 500m, memory: 512Mi}}
+        startupProbe: {httpGet: {path: /actuator/health, port: 8080}, periodSeconds: 5, failureThreshold: 24}
+        readinessProbe: {httpGet: {path: /actuator/health/readiness, port: 8080}, initialDelaySeconds: 10}
+        livenessProbe: {httpGet: {path: /actuator/health/liveness, port: 8080}, initialDelaySeconds: 20}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: false, runAsNonRoot: true}
+      securityContext: {fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch}
+      volumes:
+      - name: majoong-data
+        hostPath: {path: /var/lib/majoong-data, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: journey-service, namespace: majoong-dev}
+spec: {selector: {app: journey-service}, ports: [{port: 8080, targetPort: 8080}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: majoong-dev}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: majoong-web}}
+  template:
+    metadata: {labels: {app: majoong-web}}
+    spec:
+      containers:
+      - name: web
+        image: majoong/web:0.2.0
+        imagePullPolicy: Never
+        ports: [{containerPort: 8080}]
+        resources: {requests: {cpu: 25m, memory: 32Mi}, limits: {cpu: 100m, memory: 96Mi}}
+        readinessProbe: {httpGet: {path: /, port: 8080}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: web, namespace: majoong-dev}
+spec: {type: NodePort, selector: {app: majoong-web}, ports: [{port: 8080, targetPort: 8080, nodePort: 31443}]}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: vector, namespace: majoong-dev}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: majoong-vector-logs}
+rules:
+- apiGroups: [""]
+  resources: [namespaces, nodes, pods]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: majoong-vector-logs}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: majoong-vector-logs}
+subjects:
+- {kind: ServiceAccount, name: vector, namespace: majoong-dev}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: vector-config, namespace: majoong-dev}
+data:
+  vector.yaml: |
+    data_dir: /var/lib/vector
+    api:
+      enabled: true
+      address: 0.0.0.0:8686
+
+    sources:
+      kubernetes_logs:
+        type: kubernetes_logs
+
+    transforms:
+      majoong_logs_only:
+        type: filter
+        inputs: [kubernetes_logs]
+        condition: '.kubernetes.pod_namespace == "majoong-dev"'
+      normalize_for_elk:
+        type: remap
+        inputs: [majoong_logs_only]
+        source: |
+          .log_schema_version = 1
+          .source_type = "kubernetes"
+          .service = .kubernetes.container_name
+          .namespace = .kubernetes.pod_namespace
+          .pod = .kubernetes.pod_name
+          .node = .kubernetes.pod_node_name
+
+    sinks:
+      redis_logs:
+        type: redis
+        inputs: [normalize_for_elk]
+        endpoint: "redis://:${REDIS_PASSWORD}@redis.majoong-dev.svc.cluster.local:6379/1"
+        key: "logs:majoong:v1"
+        data_type: list
+        list_option:
+          method: rpush
+        encoding:
+          codec: json
+          timestamp_format: rfc3339
+        batch:
+          max_events: 100
+          timeout_secs: 1
+        buffer:
+          type: memory
+          max_events: 5000
+          when_full: block
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: vector, namespace: majoong-dev}
+spec:
+  selector: {matchLabels: {app: vector}}
+  template:
+    metadata:
+      labels: {app: vector}
+      annotations: {vector.dev/exclude: "true"}
+    spec:
+      serviceAccountName: vector
+      containers:
+      - name: vector
+        image: timberio/vector:0.58.0-distroless-libc
+        imagePullPolicy: IfNotPresent
+        args: ["--dangerously-allow-env-var-interpolation", "--config", "/etc/vector/vector.yaml"]
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+        - name: VECTOR_SELF_NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: VECTOR_SELF_POD_NAME
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        - name: VECTOR_SELF_POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        ports: [{name: api, containerPort: 8686}]
+        resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {cpu: 300m, memory: 256Mi}}
+        readinessProbe: {tcpSocket: {port: api}, initialDelaySeconds: 2, periodSeconds: 5}
+        livenessProbe: {tcpSocket: {port: api}, initialDelaySeconds: 10, periodSeconds: 10}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+          readOnlyRootFilesystem: true
+          runAsUser: 0
+        volumeMounts:
+        - {name: config, mountPath: /etc/vector, readOnly: true}
+        - {name: pod-logs, mountPath: /var/log/pods, readOnly: true}
+        - {name: vector-data, mountPath: /var/lib/vector}
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: config
+        configMap: {name: vector-config}
+      - name: pod-logs
+        hostPath: {path: /var/log/pods, type: Directory}
+      - name: vector-data
+        hostPath: {path: /var/lib/majoong-vector, type: DirectoryOrCreate}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: trim-vector-redis-logs, namespace: majoong-dev}
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata: {labels: {app: trim-vector-redis-logs}}
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: trim
+            image: redis:7.4-alpine
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c"]
+            args:
+            - 'redis-cli -h redis -n 1 LTRIM logs:majoong:v1 -200000 -1 >/dev/null && redis-cli -h redis -n 1 EXPIRE logs:majoong:v1 604800 >/dev/null'
+            env:
+            - name: REDISCLI_AUTH
+              valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
+            resources: {requests: {cpu: 5m, memory: 8Mi}, limits: {cpu: 50m, memory: 32Mi}}
+            securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsNonRoot: true, runAsUser: 999, runAsGroup: 1000}
+---

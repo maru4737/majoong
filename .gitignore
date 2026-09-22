@@ -1,0 +1,27 @@
+# Build output
+/target/
+
+# Codex intermediate and generated output
+/work/
+/outputs/
+
+# Local runtime data
+*.log
+*.pid
+*.local
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+kubeconfig*
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
