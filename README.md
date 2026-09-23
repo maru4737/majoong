@@ -72,6 +72,7 @@ flowchart LR
 - **Kibana**: 전체 로그, 경고·오류, 활성 서비스, 웹 요청, 서비스별 추이, 파드별 로그량, 최근 오류를 최근 30분 기준으로 제공합니다.
 - **Prometheus**: Kubernetes API, kubelet/cAdvisor, kube-state-metrics, node-exporter 지표를 30초마다 수집해 7일 또는 최대 5GB까지 보관합니다.
 - **Grafana**: 노드·파드·디플로이먼트 상태, CPU·메모리·디스크, 컨테이너 자원 사용량, 재시작, 수집 실패와 활성 경고를 한 화면에 표시합니다.
+  Nginx Basic 인증 사용자를 Auth Proxy로 조직 관리자에 연결하므로 별도 Grafana 로그인 없이 대시보드 임포트·편집이 가능하며, 로고나 홈 이동 후에도 권한이 유지됩니다.
 
 ## 서버 구성
 
@@ -108,6 +109,8 @@ kubectl apply -f deploy/k8s/majoong.yaml
 make monitoring
 make metrics
 ```
+
+Grafana 템플릿은 `/majoong-metrics/dashboard/import`에서 JSON 파일 또는 Grafana.com 대시보드 ID로 가져올 수 있습니다. 외부 요청은 Nginx Basic 인증을 통과해야 하며, Nginx가 인증 사용자 헤더를 덮어써서 Grafana에 전달합니다.
 
 컨테이너 이미지를 새 태그로 빌드한 경우, 로컬 Kubernetes 런타임(containerd)에 이미지를 적재한 뒤 매니페스트의 이미지 태그를 갱신하고 롤아웃 상태를 확인합니다.
 
