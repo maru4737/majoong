@@ -1,0 +1,418 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: majoong-monitoring
+  labels: {app.kubernetes.io/part-of: majoong-observability}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: prometheus, namespace: majoong-monitoring}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: majoong-prometheus}
+rules:
+- apiGroups: [""]
+  resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods, namespaces]
+  verbs: [get, list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list, watch]
+- nonResourceURLs: [/metrics]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: majoong-prometheus}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: majoong-prometheus}
+subjects:
+- {kind: ServiceAccount, name: prometheus, namespace: majoong-monitoring}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kube-state-metrics, namespace: majoong-monitoring}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: majoong-kube-state-metrics}
+rules:
+- apiGroups: [""]
+  resources: [configmaps, endpoints, limitranges, namespaces, nodes, persistentvolumeclaims, persistentvolumes, pods, replicationcontrollers, resourcequotas, secrets, services]
+  verbs: [list, watch]
+- apiGroups: [apps]
+  resources: [daemonsets, deployments, replicasets, statefulsets]
+  verbs: [list, watch]
+- apiGroups: [batch]
+  resources: [cronjobs, jobs]
+  verbs: [list, watch]
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [list, watch]
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses, networkpolicies]
+  verbs: [list, watch]
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [list, watch]
+- apiGroups: [storage.k8s.io]
+  resources: [storageclasses, volumeattachments]
+  verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: majoong-kube-state-metrics}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: majoong-kube-state-metrics}
+subjects:
+- {kind: ServiceAccount, name: kube-state-metrics, namespace: majoong-monitoring}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: prometheus-config, namespace: majoong-monitoring}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: majoong-local
+    rule_files:
+      - /etc/prometheus/rules.yml
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: [localhost:9090]
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: [kube-state-metrics.majoong-monitoring.svc.cluster.local:8080]
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: majoong-monitoring
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: node-exporter
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: metrics
+      - job_name: kubernetes-apiserver
+        kubernetes_sd_configs:
+          - role: endpoints
+        scheme: https
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: default;kubernetes;https
+      - job_name: kubernetes-nodes
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+      - job_name: kubernetes-cadvisor
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+  rules.yml: |
+    groups:
+      - name: kubernetes-health
+        rules:
+          - alert: KubernetesTargetDown
+            expr: up == 0
+            for: 2m
+            labels: {severity: warning}
+            annotations:
+              summary: "Prometheus 수집 대상이 응답하지 않습니다."
+          - alert: PodRestartingRepeatedly
+            expr: sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[15m])) > 2
+            for: 5m
+            labels: {severity: warning}
+            annotations:
+              summary: "파드가 반복해서 재시작되고 있습니다."
+          - alert: DeploymentReplicasUnavailable
+            expr: kube_deployment_spec_replicas > kube_deployment_status_replicas_available
+            for: 5m
+            labels: {severity: critical}
+            annotations:
+              summary: "디플로이먼트의 가용 레플리카가 부족합니다."
+          - alert: NodeMemoryLow
+            expr: 100 * node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 10
+            for: 10m
+            labels: {severity: warning}
+            annotations:
+              summary: "노드의 사용 가능한 메모리가 10% 미만입니다."
+          - alert: NodeFilesystemLow
+            expr: 100 * node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"} < 10
+            for: 10m
+            labels: {severity: critical}
+            annotations:
+              summary: "노드 파일시스템의 여유 공간이 10% 미만입니다."
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: prometheus, namespace: majoong-monitoring}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: prometheus}}
+  template:
+    metadata: {labels: {app: prometheus}}
+    spec:
+      serviceAccountName: prometheus
+      initContainers:
+      - name: prepare-prometheus-data
+        image: busybox:1.37.0
+        command: [sh, -c, "chown -R 65534:65534 /prometheus"]
+        securityContext: {runAsUser: 0}
+        volumeMounts: [{name: data, mountPath: /prometheus}]
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v3.14.0
+        args:
+          - --config.file=/etc/prometheus/prometheus.yml
+          - --storage.tsdb.path=/prometheus
+          - --storage.tsdb.retention.time=7d
+          - --storage.tsdb.retention.size=5GB
+          - --web.enable-lifecycle
+        ports: [{name: http, containerPort: 9090}]
+        volumeMounts:
+          - {name: config, mountPath: /etc/prometheus, readOnly: true}
+          - {name: data, mountPath: /prometheus}
+        resources:
+          requests: {cpu: 150m, memory: 384Mi}
+          limits: {cpu: "1", memory: 900Mi}
+        readinessProbe: {httpGet: {path: /-/ready, port: http}, initialDelaySeconds: 5, periodSeconds: 10}
+        livenessProbe: {httpGet: {path: /-/healthy, port: http}, initialDelaySeconds: 20, periodSeconds: 15}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsUser: 65534, runAsGroup: 65534}
+      volumes:
+        - name: config
+          configMap: {name: prometheus-config}
+        - name: data
+          hostPath: {path: /var/lib/majoong-prometheus, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus, namespace: majoong-monitoring}
+spec: {selector: {app: prometheus}, ports: [{name: http, port: 9090, targetPort: http}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: kube-state-metrics, namespace: majoong-monitoring}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: kube-state-metrics}}
+  template:
+    metadata: {labels: {app: kube-state-metrics}}
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+      - name: kube-state-metrics
+        image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0
+        args:
+          - --resources=pods,nodes,deployments,replicasets,statefulsets,daemonsets,jobs,cronjobs,namespaces,persistentvolumes,persistentvolumeclaims,services
+        ports:
+          - {name: http, containerPort: 8080}
+          - {name: telemetry, containerPort: 8081}
+        resources: {requests: {cpu: 25m, memory: 64Mi}, limits: {cpu: 200m, memory: 192Mi}}
+        readinessProbe: {tcpSocket: {port: http}, initialDelaySeconds: 5, periodSeconds: 10}
+        livenessProbe: {tcpSocket: {port: telemetry}, initialDelaySeconds: 15, periodSeconds: 10}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: kube-state-metrics, namespace: majoong-monitoring}
+spec: {selector: {app: kube-state-metrics}, ports: [{name: http, port: 8080, targetPort: http}]}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: node-exporter, namespace: majoong-monitoring}
+spec:
+  selector: {matchLabels: {app: node-exporter}}
+  template:
+    metadata: {labels: {app: node-exporter}}
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: node-exporter
+        image: quay.io/prometheus/node-exporter:v1.12.1
+        args:
+          - --path.procfs=/host/proc
+          - --path.sysfs=/host/sys
+          - --path.rootfs=/host/root
+          - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+        ports: [{name: metrics, containerPort: 9100, hostPort: 9100}]
+        volumeMounts:
+          - {name: proc, mountPath: /host/proc, readOnly: true}
+          - {name: sys, mountPath: /host/sys, readOnly: true}
+          - {name: root, mountPath: /host/root, readOnly: true, mountPropagation: HostToContainer}
+        resources: {requests: {cpu: 20m, memory: 32Mi}, limits: {cpu: 150m, memory: 96Mi}}
+        readinessProbe: {httpGet: {path: /, port: metrics}, initialDelaySeconds: 3}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true, runAsUser: 65534, runAsGroup: 65534}
+      tolerations: [{operator: Exists}]
+      volumes:
+        - {name: proc, hostPath: {path: /proc}}
+        - {name: sys, hostPath: {path: /sys}}
+        - {name: root, hostPath: {path: /}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: node-exporter, namespace: majoong-monitoring}
+spec:
+  clusterIP: None
+  selector: {app: node-exporter}
+  ports: [{name: metrics, port: 9100, targetPort: metrics}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-provisioning, namespace: majoong-monitoring}
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.majoong-monitoring.svc.cluster.local:9090
+        isDefault: true
+        editable: false
+        jsonData:
+          timeInterval: 30s
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: Majoong Kubernetes
+        orgId: 1
+        folder: 마중구름
+        type: file
+        disableDeletion: true
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-kubernetes-dashboard, namespace: majoong-monitoring}
+data:
+  kubernetes.json: |
+    {
+      "annotations":{"list":[]},
+      "editable":false,
+      "fiscalYearStartMonth":0,
+      "graphTooltip":1,
+      "id":null,
+      "links":[{"title":"Kibana 로그 대시보드","type":"link","url":"/majoong-monitor/app/dashboards#/view/majoong-operations","targetBlank":true}],
+      "panels":[
+        {"type":"stat","title":"노드","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"count(kube_node_info)","refId":"A"}],"gridPos":{"h":4,"w":4,"x":0,"y":0},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center"},"fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"green","value":1}]}},"overrides":[]}},
+        {"type":"stat","title":"실행 중인 파드","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(kube_pod_status_phase{phase=\"Running\"})","refId":"A"}],"gridPos":{"h":4,"w":4,"x":4,"y":0},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center"},"fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"blue","value":null}]}},"overrides":[]}},
+        {"type":"stat","title":"가용 디플로이먼트","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(kube_deployment_status_replicas_available)","refId":"A"}],"gridPos":{"h":4,"w":4,"x":8,"y":0},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center"},"fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"purple","value":null}]}},"overrides":[]}},
+        {"type":"stat","title":"최근 1시간 재시작","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(increase(kube_pod_container_status_restarts_total[1h])) or vector(0)","refId":"A"}],"gridPos":{"h":4,"w":4,"x":12,"y":0},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center"},"fieldConfig":{"defaults":{"decimals":0,"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":1},{"color":"red","value":5}]}},"overrides":[]}},
+        {"type":"stat","title":"정상 수집 대상","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(up)","refId":"A"}],"gridPos":{"h":4,"w":4,"x":16,"y":0},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center"},"fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"red","value":null},{"color":"green","value":1}]}},"overrides":[]}},
+        {"type":"stat","title":"활성 경고","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(ALERTS{alertstate=\"firing\"}) or vector(0)","refId":"A"}],"gridPos":{"h":4,"w":4,"x":20,"y":0},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center"},"fieldConfig":{"defaults":{"decimals":0,"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},"overrides":[]}},
+        {"type":"timeseries","title":"노드 CPU 사용률","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)","legendFormat":"{{instance}}","refId":"A"}],"gridPos":{"h":8,"w":12,"x":0,"y":4},"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":70},{"color":"red","value":90}]}},"overrides":[]}},
+        {"type":"timeseries","title":"노드 메모리 사용률","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)","legendFormat":"{{instance}}","refId":"A"}],"gridPos":{"h":8,"w":12,"x":12,"y":4},"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":75},{"color":"red","value":90}]}},"overrides":[]}},
+        {"type":"timeseries","title":"네임스페이스별 컨테이너 CPU","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace) (rate(container_cpu_usage_seconds_total{container!=\"\",image!=\"\"}[5m]))","legendFormat":"{{namespace}}","refId":"A"}],"gridPos":{"h":8,"w":12,"x":0,"y":12},"fieldConfig":{"defaults":{"unit":"cores"},"overrides":[]}},
+        {"type":"timeseries","title":"네임스페이스별 컨테이너 메모리","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace) (container_memory_working_set_bytes{container!=\"\",image!=\"\"})","legendFormat":"{{namespace}}","refId":"A"}],"gridPos":{"h":8,"w":12,"x":12,"y":12},"fieldConfig":{"defaults":{"unit":"bytes"},"overrides":[]}},
+        {"type":"timeseries","title":"파드 상태","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(phase) (kube_pod_status_phase)","legendFormat":"{{phase}}","refId":"A"}],"gridPos":{"h":8,"w":8,"x":0,"y":20},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}},
+        {"type":"timeseries","title":"디플로이먼트 원하는/가용 레플리카","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace) (kube_deployment_spec_replicas)","legendFormat":"원하는 수 · {{namespace}}","refId":"A"},{"expr":"sum by(namespace) (kube_deployment_status_replicas_available)","legendFormat":"가용 · {{namespace}}","refId":"B"}],"gridPos":{"h":8,"w":8,"x":8,"y":20},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}},
+        {"type":"timeseries","title":"루트 파일시스템 사용률","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"100 * (1 - node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"})","legendFormat":"{{instance}}","refId":"A"}],"gridPos":{"h":8,"w":8,"x":16,"y":20},"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":75},{"color":"red","value":90}]}},"overrides":[]}},
+        {"type":"table","title":"파드별 최근 1시간 재시작","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace, pod) (increase(kube_pod_container_status_restarts_total[1h])) > 0","format":"table","instant":true,"refId":"A"}],"gridPos":{"h":8,"w":12,"x":0,"y":28},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}},
+        {"type":"table","title":"현재 비정상 파드","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace, pod, phase) (kube_pod_status_phase{phase=~\"Pending|Failed|Unknown\"} == 1)","format":"table","instant":true,"refId":"A"}],"gridPos":{"h":8,"w":12,"x":12,"y":28},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}}
+      ],
+      "refresh":"30s",
+      "schemaVersion":42,
+      "tags":["kubernetes","majoong","operations"],
+      "templating":{"list":[]},
+      "time":{"from":"now-3h","to":"now"},
+      "timepicker":{},
+      "timezone":"browser",
+      "title":"마중구름 Kubernetes 운영 현황",
+      "uid":"majoong-kubernetes",
+      "version":1
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grafana, namespace: majoong-monitoring}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grafana}}
+  template:
+    metadata: {labels: {app: grafana}}
+    spec:
+      initContainers:
+      - name: prepare-grafana-data
+        image: busybox:1.37.0
+        command: [sh, -c, "chown -R 472:472 /var/lib/grafana"]
+        securityContext: {runAsUser: 0}
+        volumeMounts: [{name: data, mountPath: /var/lib/grafana}]
+      containers:
+      - name: grafana
+        image: grafana/grafana:13.2.2
+        env:
+          - {name: GF_SERVER_ROOT_URL, value: "https://maru4737.duckdns.org/majoong-metrics/"}
+          - {name: GF_SERVER_SERVE_FROM_SUB_PATH, value: "true"}
+          - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}
+          - {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Viewer}
+          - {name: GF_AUTH_DISABLE_LOGIN_FORM, value: "true"}
+          - {name: GF_USERS_DEFAULT_THEME, value: dark}
+          - {name: GF_ANALYTICS_REPORTING_ENABLED, value: "false"}
+          - {name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false"}
+          - {name: GF_SECURITY_ADMIN_USER, valueFrom: {secretKeyRef: {name: grafana-admin, key: username}}}
+          - {name: GF_SECURITY_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: grafana-admin, key: password}}}
+          - {name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /var/lib/grafana/dashboards/kubernetes.json}
+        ports: [{name: http, containerPort: 3000}]
+        volumeMounts:
+          - {name: data, mountPath: /var/lib/grafana}
+          - {name: datasources, mountPath: /etc/grafana/provisioning/datasources, readOnly: true}
+          - {name: providers, mountPath: /etc/grafana/provisioning/dashboards, readOnly: true}
+          - {name: dashboards, mountPath: /var/lib/grafana/dashboards, readOnly: true}
+        resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 400m, memory: 384Mi}}
+        readinessProbe: {httpGet: {path: /api/health, port: http}, initialDelaySeconds: 10, periodSeconds: 10}
+        livenessProbe: {httpGet: {path: /api/health, port: http}, initialDelaySeconds: 30, periodSeconds: 20}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, runAsUser: 472, runAsGroup: 472}
+      volumes:
+        - name: data
+          hostPath: {path: /var/lib/majoong-grafana, type: DirectoryOrCreate}
+        - name: datasources
+          configMap: {name: grafana-provisioning, items: [{key: datasource.yaml, path: datasource.yaml}]}
+        - name: providers
+          configMap: {name: grafana-provisioning, items: [{key: provider.yaml, path: provider.yaml}]}
+        - name: dashboards
+          configMap: {name: grafana-kubernetes-dashboard}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grafana, namespace: majoong-monitoring}
+spec:
+  type: NodePort
+  selector: {app: grafana}
+  ports: [{name: http, port: 3000, targetPort: http, nodePort: 32080}]

@@ -4,6 +4,7 @@
 
 - 서비스: `https://maru4737.duckdns.org/majoong/`
 - 운영 대시보드: `https://maru4737.duckdns.org/majoong-monitor/`
+- Kubernetes 대시보드: `https://maru4737.duckdns.org/majoong-metrics/d/majoong-kubernetes/majoong-kubernetes`
 - 배포 환경: 단일 노드 Kubernetes, `majoong-dev` 네임스페이스
 
 ## 핵심 기능
@@ -28,7 +29,7 @@
 | --- | --- | --- |
 | 제품·시스템 설계 | GPT-6 Astra | API 선택, 데이터 흐름, UX·운영 요구사항 및 위험요소 설계 |
 | 구현·배포 | GPT-5.6 Terra | Java/웹 코드, 컨테이너 이미지, Kubernetes·Nginx·ELK 구성 구현 |
-| 브라우저 검증 | Browser control skill | 실제 배포 화면의 검색, 항공편 선택, 모바일 흐름, Kibana 패널 오류 확인 |
+| 브라우저 검증 | Browser control skill | 실제 배포 화면의 검색, 항공편 선택, 모바일 흐름, Kibana·Grafana 접근 경계 확인 |
 | 캐릭터·시각 자산 | Image generation skill | 서비스의 구름 조종사 캐릭터 등 화면용 비트맵 자산 제작 |
 | 코드·운영 도구 | Maven, Docker, containerd, kubectl, Nginx, Git | 테스트, 이미지 빌드·적재, 배포, 443 프록시, 버전 관리 |
 
@@ -48,6 +49,11 @@ flowchart LR
   L --> E[(Elasticsearch<br/>majoong-logs-v2-*)]
   E --> KB[Kibana 운영 대시보드]
   N -->|HTTPS 443 /majoong-monitor| KB
+  K --> P[(Prometheus<br/>7일 · 최대 5GB)]
+  KS[kube-state-metrics] --> P
+  NE[node-exporter] --> P
+  P --> G[Grafana Kubernetes 대시보드]
+  N -->|HTTPS 443 /majoong-metrics| G
 ```
 
 ### 애플리케이션 계층
@@ -64,21 +70,25 @@ flowchart LR
 - **Logstash**: Redis 리스트를 FIFO로 소비해 Elasticsearch로 적재합니다. 작은 배치 단위로 처리해 누적 로그 재처리 시에도 메모리 사용량을 제어합니다.
 - **Elasticsearch**: `majoong-logs-v2-*` 인덱스에 고정 필드 매핑으로 저장합니다. 이전 인덱스와의 필드 타입 충돌을 분리했으며 ILM 정책으로 7일 후 삭제합니다.
 - **Kibana**: 전체 로그, 경고·오류, 활성 서비스, 웹 요청, 서비스별 추이, 파드별 로그량, 최근 오류를 최근 30분 기준으로 제공합니다.
+- **Prometheus**: Kubernetes API, kubelet/cAdvisor, kube-state-metrics, node-exporter 지표를 30초마다 수집해 7일 또는 최대 5GB까지 보관합니다.
+- **Grafana**: 노드·파드·디플로이먼트 상태, CPU·메모리·디스크, 컨테이너 자원 사용량, 재시작, 수집 실패와 활성 경고를 한 화면에 표시합니다.
 
 ## 서버 구성
 
 | 구성요소 | 기술/버전 | 역할 |
 | --- | --- | --- |
 | 런타임 | Kubernetes | 서비스·데이터·관측성 워크로드 오케스트레이션 |
-| 엣지 | Nginx + TLS 443 | `/majoong/`, `/majoong-monitor/` 경로 라우팅 및 Kibana Basic 인증 |
+| 엣지 | Nginx + TLS 443 | `/majoong/`, `/majoong-monitor/`, `/majoong-metrics/` 라우팅 및 운영 화면 Basic 인증 |
 | 백엔드 | Java 21, Spring Boot 3.5 | API, OpenAPI 연동, 공유·여정 도메인 |
 | 프런트엔드 | Nginx 1.27, Vanilla JS | 사용자 화면 제공 |
 | 캐시/버퍼 | Redis 7.4 | 조회 캐시 DB 0, Vector 로그 큐 DB 1 |
 | 로그 수집 | Vector 0.58 | Kubernetes 로그 수집·정규화 |
 | 로그 처리 | Logstash 9.5 | Redis → Elasticsearch 적재 |
 | 로그 검색/대시보드 | Elasticsearch/Kibana 9.5 | 로그 보관·운영 시각화 |
+| 메트릭 수집 | Prometheus 3.14, kube-state-metrics 2.20, node-exporter 1.12 | Kubernetes·노드·컨테이너 상태 수집 |
+| 메트릭 대시보드 | Grafana 13.2 | 클러스터 상태·자원·재시작·경고 시각화 |
 
-현재 배포 이미지 태그는 `majoong/journey-service:0.4.1`, `majoong/web:0.4.1`입니다.
+현재 배포 이미지 태그는 `majoong/journey-service:0.4.1`, `majoong/web:0.4.2`입니다.
 
 ## 배포 구성과 운영
 
@@ -86,6 +96,7 @@ flowchart LR
 
 - `deploy/k8s/majoong.yaml`: Redis, Journey Service, Web, Vector, 로그 정리 CronJob
 - `deploy/k8s/elk.yaml`: Elasticsearch, Logstash, Kibana, 7일 ILM, Kibana 부트스트랩
+- `deploy/k8s/metrics.yaml`: Prometheus, Grafana, kube-state-metrics, node-exporter와 Kubernetes 운영 대시보드
 - `deploy/k8s/majoong-proxy.conf`: Nginx 443 경로 프록시와 운영 화면 인증 경계
 - `deploy/kibana/majoong-operations-dashboard.json`: Kibana 운영 대시보드 정의
 
@@ -95,6 +106,7 @@ flowchart LR
 mvn test
 kubectl apply -f deploy/k8s/majoong.yaml
 make monitoring
+make metrics
 ```
 
 컨테이너 이미지를 새 태그로 빌드한 경우, 로컬 Kubernetes 런타임(containerd)에 이미지를 적재한 뒤 매니페스트의 이미지 태그를 갱신하고 롤아웃 상태를 확인합니다.
@@ -121,5 +133,6 @@ kubectl -n majoong-dev rollout status deployment/logstash
 - 실제 `CX426` 항공편 선택과 터미널·출구·수하물 정보 표시
 - 검색 URL 상태 복원과 긴 결과 목록 점진 표시
 - Kibana 대시보드의 과거 `verification_exception` 필드 매핑 오류 제거
+- Prometheus 6개 수집 대상 전체 `UP`, Grafana 데이터소스·15개 패널·핵심 쿼리 응답 확인
 
 API 개발 키는 호출량 제한이 있으므로 운영 환경에서는 캐시 적중률, 오류율, OpenAPI 일일 사용량을 함께 관찰해야 합니다.
