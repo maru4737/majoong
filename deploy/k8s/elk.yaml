@@ -56,7 +56,7 @@ data:
     queue.type: persisted
     queue.max_bytes: 256mb
     pipeline.workers: 1
-    pipeline.batch.size: 50
+    pipeline.batch.size: 10
   majoong.conf: |
     input {
       redis {
@@ -79,7 +79,7 @@ data:
     output {
       elasticsearch {
         hosts => ["http://elasticsearch:9200"]
-        index => "majoong-logs-%{+YYYY.MM.dd}"
+        index => "majoong-logs-v2-%{+YYYY.MM.dd}"
         ilm_enabled => false
       }
     }
@@ -113,7 +113,7 @@ spec:
         image: docker.elastic.co/logstash/logstash:9.5.4
         imagePullPolicy: IfNotPresent
         env:
-        - {name: LS_JAVA_OPTS, value: "-Xms384m -Xmx384m"}
+        - {name: LS_JAVA_OPTS, value: "-Xms640m -Xmx640m"}
         - name: REDIS_PASSWORD
           valueFrom: {secretKeyRef: {name: redis-auth, key: password}}
         ports: [{name: api, containerPort: 9600}]
@@ -121,7 +121,7 @@ spec:
         - {name: settings, mountPath: /usr/share/logstash/config/logstash.yml, subPath: logstash.yml, readOnly: true}
         - {name: pipeline, mountPath: /usr/share/logstash/pipeline, readOnly: true}
         - {name: data, mountPath: /usr/share/logstash/data}
-        resources: {requests: {cpu: 100m, memory: 512Mi}, limits: {cpu: "1", memory: 896Mi}}
+        resources: {requests: {cpu: 100m, memory: 768Mi}, limits: {cpu: "1", memory: 1400Mi}}
         startupProbe: {tcpSocket: {port: api}, periodSeconds: 5, failureThreshold: 90}
         readinessProbe: {tcpSocket: {port: api}, periodSeconds: 10}
         livenessProbe: {tcpSocket: {port: api}, initialDelaySeconds: 60, periodSeconds: 20}
@@ -194,9 +194,9 @@ data:
     KB=http://kibana:5601/majoong-monitor
     until curl -fsS "$ES/_cluster/health" >/dev/null; do sleep 3; done
     curl -fsS -X PUT "$ES/_ilm/policy/majoong-logs-7-days" -H 'Content-Type: application/json' -d '{"policy":{"phases":{"hot":{"actions":{}},"delete":{"min_age":"7d","actions":{"delete":{}}}}}}' >/dev/null
-    curl -fsS -X PUT "$ES/_index_template/majoong-logs-template" -H 'Content-Type: application/json' -d '{"index_patterns":["majoong-logs-*"],"priority":500,"template":{"settings":{"index.lifecycle.name":"majoong-logs-7-days","number_of_shards":1,"number_of_replicas":0},"mappings":{"properties":{"@timestamp":{"type":"date"},"service":{"type":"keyword"},"namespace":{"type":"keyword"},"pod":{"type":"keyword"},"node":{"type":"keyword"},"stream":{"type":"keyword"},"source_type":{"type":"keyword"},"log_schema_version":{"type":"integer"},"message":{"type":"match_only_text"}}}}}' >/dev/null
+    curl -fsS -X PUT "$ES/_index_template/majoong-logs-v2-template" -H 'Content-Type: application/json' -d '{"index_patterns":["majoong-logs-v2-*"],"priority":600,"template":{"settings":{"index.lifecycle.name":"majoong-logs-7-days","number_of_shards":1,"number_of_replicas":0},"mappings":{"dynamic":false,"properties":{"@timestamp":{"type":"date"},"service":{"type":"keyword"},"namespace":{"type":"keyword"},"pod":{"type":"keyword"},"node":{"type":"keyword"},"stream":{"type":"keyword"},"source_type":{"type":"keyword"},"ingested_by":{"type":"keyword"},"log_schema_version":{"type":"integer"},"message":{"type":"match_only_text"}}}}}' >/dev/null
     until curl -fsS "$KB/api/status" >/dev/null; do sleep 5; done
-    response=$(curl -fsS -X POST "$KB/api/data_views/data_view" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d '{"data_view":{"title":"majoong-logs-*","name":"마중 운영 로그","timeFieldName":"@timestamp","allowNoIndex":true},"override":true}')
+    response=$(curl -fsS -X POST "$KB/api/data_views/data_view" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d '{"data_view":{"title":"majoong-logs-v2-*","name":"마중 운영 로그","timeFieldName":"@timestamp","allowNoIndex":true},"override":true}')
     view_id=$(printf '%s' "$response" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
     test -n "$view_id"
     curl -fsS -X POST "$KB/api/data_views/default" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "{\"data_view_id\":\"$view_id\",\"force\":true}" >/dev/null
