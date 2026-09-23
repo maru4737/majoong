@@ -78,7 +78,7 @@ flowchart LR
 | 로그 처리 | Logstash 9.5 | Redis → Elasticsearch 적재 |
 | 로그 검색/대시보드 | Elasticsearch/Kibana 9.5 | 로그 보관·운영 시각화 |
 
-현재 배포 이미지 태그는 `majoong/journey-service:0.3.3`, `majoong/web:0.3.3`입니다.
+현재 배포 이미지 태그는 `majoong/journey-service:0.4.1`, `majoong/web:0.4.1`입니다.
 
 ## 배포 구성과 운영
 
