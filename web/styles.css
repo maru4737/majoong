@@ -5,3 +5,5 @@
 .sr{clip:rect(0,0,0,0)}
 [hidden]{display:none!important}
 @media(max-width:720px){.hero p{max-width:62%}}
+@media(max-width:720px){.nav{gap:6px;padding:6px 14px;min-height:60px}.brand{min-height:42px}.nav-links{flex:1;min-width:0;justify-content:flex-end;overflow-x:auto;scrollbar-width:none}.nav-links::-webkit-scrollbar{display:none}.nav-links>button{flex:0 0 auto}.shell{padding-inline:14px}.search-panel{border-radius:16px}.card{padding:16px}.wallet-actions{display:grid;grid-template-columns:1fr 1fr}.wallet-actions button{width:100%}.toast{width:calc(100vw - 28px);text-align:center}}
+@media(max-width:430px){.nav{align-items:center}.brand{font-size:18px}.nav-links>button{font-size:12px;padding:8px 6px}.hero{padding:24px 20px}.hero h1{font-size:27px}.hero-copy{max-width:68%}.hero p{max-width:64%}.pilot{width:150px;right:-24px}.quick-days{margin-inline:-2px;padding-inline:2px}.flight{gap:10px;padding-block:14px}.flight-number{font-size:17px}.flight-meta{font-size:12px}.choose{width:100%}.wallet-actions{grid-template-columns:1fr}.notification-panel{top:66px;right:10px;width:calc(100vw - 20px)}}
