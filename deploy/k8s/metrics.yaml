@@ -84,6 +84,10 @@ data:
       - job_name: kube-state-metrics
         static_configs:
           - targets: [kube-state-metrics.majoong-monitoring.svc.cluster.local:8080]
+      - job_name: majoong-journey-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: [journey-service.majoong-dev.svc.cluster.local:8080]
       - job_name: node-exporter
         kubernetes_sd_configs:
           - role: endpoints
@@ -181,6 +185,7 @@ kind: Deployment
 metadata: {name: prometheus, namespace: majoong-monitoring}
 spec:
   replicas: 1
+  strategy: {type: Recreate}
   selector: {matchLabels: {app: prometheus}}
   template:
     metadata: {labels: {app: prometheus}}
@@ -345,7 +350,11 @@ data:
         {"type":"timeseries","title":"디플로이먼트 원하는/가용 레플리카","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace) (kube_deployment_spec_replicas)","legendFormat":"원하는 수 · {{namespace}}","refId":"A"},{"expr":"sum by(namespace) (kube_deployment_status_replicas_available)","legendFormat":"가용 · {{namespace}}","refId":"B"}],"gridPos":{"h":8,"w":8,"x":8,"y":20},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}},
         {"type":"timeseries","title":"루트 파일시스템 사용률","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"100 * (1 - node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"})","legendFormat":"{{instance}}","refId":"A"}],"gridPos":{"h":8,"w":8,"x":16,"y":20},"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100,"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"orange","value":75},{"color":"red","value":90}]}},"overrides":[]}},
         {"type":"table","title":"파드별 최근 1시간 재시작","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace, pod) (increase(kube_pod_container_status_restarts_total[1h])) > 0","format":"table","instant":true,"refId":"A"}],"gridPos":{"h":8,"w":12,"x":0,"y":28},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}},
-        {"type":"table","title":"현재 비정상 파드","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace, pod, phase) (kube_pod_status_phase{phase=~\"Pending|Failed|Unknown\"} == 1)","format":"table","instant":true,"refId":"A"}],"gridPos":{"h":8,"w":12,"x":12,"y":28},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}}
+        {"type":"table","title":"현재 비정상 파드","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum by(namespace, pod, phase) (kube_pod_status_phase{phase=~\"Pending|Failed|Unknown\"} == 1)","format":"table","instant":true,"refId":"A"}],"gridPos":{"h":8,"w":12,"x":12,"y":28},"fieldConfig":{"defaults":{"decimals":0},"overrides":[]}},
+        {"type":"stat","title":"항공 API 호출","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(majoong_upstream_calls_total)","refId":"A"}],"gridPos":{"h":5,"w":6,"x":0,"y":36},"options":{"colorMode":"background","graphMode":"area","justifyMode":"center"},"fieldConfig":{"defaults":{"decimals":0,"color":{"mode":"continuous-BlPu"}},"overrides":[]}},
+        {"type":"stat","title":"항공 API 실패","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(majoong_upstream_failures_total) or vector(0)","refId":"A"}],"gridPos":{"h":5,"w":6,"x":6,"y":36},"options":{"colorMode":"background","graphMode":"area","justifyMode":"center"},"fieldConfig":{"defaults":{"decimals":0,"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},"overrides":[]}},
+        {"type":"stat","title":"항공편 캐시 적중","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(majoong_flight_cache_hits_total)","refId":"A"}],"gridPos":{"h":5,"w":6,"x":12,"y":36},"options":{"colorMode":"background","graphMode":"area","justifyMode":"center"},"fieldConfig":{"defaults":{"decimals":0,"color":{"mode":"continuous-GnYlRd"}},"overrides":[]}},
+        {"type":"stat","title":"여행 지갑 저장","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[{"expr":"sum(majoong_trip_writes_total)","refId":"A"}],"gridPos":{"h":5,"w":6,"x":18,"y":36},"options":{"colorMode":"background","graphMode":"area","justifyMode":"center"},"fieldConfig":{"defaults":{"decimals":0,"color":{"mode":"continuous-BlPu"}},"overrides":[]}}
       ],
       "refresh":"30s",
       "schemaVersion":42,
