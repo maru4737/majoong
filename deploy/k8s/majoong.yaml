@@ -159,12 +159,13 @@ data:
         extra_field_selector: metadata.namespace=majoong-dev
         include_paths_glob_patterns:
           - /var/log/pods/majoong-dev_*/*/*.log
+        read_from: end
 
     transforms:
       majoong_logs_only:
         type: filter
         inputs: [kubernetes_logs]
-        condition: '.kubernetes.pod_namespace == "majoong-dev"'
+        condition: '.kubernetes.pod_namespace == "majoong-dev" && .kubernetes.container_name != "vector" && .kubernetes.container_name != "logstash"'
       normalize_for_elk:
         type: remap
         inputs: [majoong_logs_only]
