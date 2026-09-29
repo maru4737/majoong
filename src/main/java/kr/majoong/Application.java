@@ -19,6 +19,8 @@ import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.*;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.util.WebUtils;
@@ -63,8 +65,11 @@ public class Application {
     db.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS revision BIGINT DEFAULT 1 NOT NULL");
     db.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL");
     db.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE NOT NULL");
+    db.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE");
+    db.execute("ALTER TABLE trips ADD COLUMN IF NOT EXISTS purge_at TIMESTAMP WITH TIME ZONE");
     db.execute("CREATE TABLE IF NOT EXISTS watches (id VARCHAR(36) PRIMARY KEY, owner_hash VARCHAR(64) NOT NULL, provider_id VARCHAR(160) NOT NULL, flight VARCHAR(32) NOT NULL, direction VARCHAR(16) NOT NULL, scheduled_date VARCHAR(10) NOT NULL, snapshot_json CLOB NOT NULL, created_at TIMESTAMP WITH TIME ZONE NOT NULL, UNIQUE(owner_hash,provider_id,direction,scheduled_date))");
     db.execute("CREATE TABLE IF NOT EXISTS notifications (id VARCHAR(36) PRIMARY KEY, owner_hash VARCHAR(64) NOT NULL, watch_id VARCHAR(36) NOT NULL, change_key VARCHAR(240) NOT NULL, title VARCHAR(160) NOT NULL, message VARCHAR(500) NOT NULL, created_at TIMESTAMP WITH TIME ZONE NOT NULL, read_at TIMESTAMP WITH TIME ZONE, UNIQUE(watch_id,change_key))");
+    db.execute("CREATE TABLE IF NOT EXISTS source_usage (usage_date VARCHAR(10) PRIMARY KEY, used_calls INTEGER NOT NULL, updated_at TIMESTAMP WITH TIME ZONE NOT NULL)");
   }
 
   private boolean live(){return mode.equalsIgnoreCase("live");}
@@ -74,6 +79,7 @@ public class Application {
       @RequestParam(required=false) String q,@RequestParam(required=false) String flightNumber,
       @RequestParam(defaultValue="ARRIVAL") String direction){
     String requestedDate=firstNonBlank(date,arrivalDate,"today"),query=firstNonBlank(q,flightNumber,"");
+    if(query.length()>40)throw new Bad("검색어는 40자 이내로 입력해 주세요.");
     String normalizedDirection=normalizedDirection(direction);
     LocalDate today=LocalDate.now(SEOUL),requested;
     try{requested="today".equalsIgnoreCase(requestedDate)?today:LocalDate.parse(requestedDate);}
@@ -88,7 +94,7 @@ public class Application {
     if(icnServiceKey.isBlank())throw new SourceUnavailable("공항 데이터 인증이 설정되지 않았어요.");
     String cacheKey="majoong:flights:"+date+":"+direction;
     Map<String,Object> base=readCache(cacheKey);
-    if(base!=null){cacheHits.increment();observeWatches(date,direction,base);return filter(base,query);}
+    if(base!=null){cacheHits.increment();observeWatches(date,direction,base);return filter(withFreshness(base),query);}
     Object lock=collectionLocks.computeIfAbsent(cacheKey,key->new Object());
     synchronized(lock){
       try{
@@ -97,7 +103,7 @@ public class Application {
       }finally{collectionLocks.remove(cacheKey,lock);}
     }
     observeWatches(date,direction,base);
-    return filter(base,query);
+    return filter(withFreshness(base),query);
   }
 
   private Map<String,Object> collectFlights(String date,boolean departure){
@@ -135,6 +141,7 @@ public class Application {
   }
 
   private JsonNodeResult fetch(String date,boolean departure,int pageNo){
+    reserveUpstreamCall();
     upstreamCalls.increment();
     try{
       var root=http.get().uri(builder->builder.scheme("https").host("apis.data.go.kr").path(departure?"/B551177/statusOfAllFltDeOdp/getFltDeparturesDeOdp":"/B551177/statusOfAllFltDeOdp/getFltArrivalsDeOdp")
@@ -148,8 +155,30 @@ public class Application {
     }catch(SourceUnavailable e){upstreamFailures.increment();throw e;}catch(Exception e){upstreamFailures.increment();throw new SourceUnavailable("공항 데이터 원본이 응답하지 않았어요.");}
   }
 
+  /** Development credentials are a shared daily budget, never a budget per browser. */
+  private void reserveUpstreamCall(){
+    String day=LocalDate.now(SEOUL).toString();synchronized(writeLock){
+      int changed=db.update("UPDATE source_usage SET used_calls=used_calls+1,updated_at=? WHERE usage_date=? AND used_calls<450",Instant.now(),day);
+      if(changed==1)return;
+      try{db.update("INSERT INTO source_usage (usage_date,used_calls,updated_at) VALUES (?,?,?)",day,1,Instant.now());return;}
+      catch(Exception ignored){int retry=db.update("UPDATE source_usage SET used_calls=used_calls+1,updated_at=? WHERE usage_date=? AND used_calls<450",Instant.now(),day);if(retry==1)return;}
+    }
+    throw new SourceUnavailable("오늘 공항 데이터 조회 한도에 도달했어요. 마지막 확인 정보를 다시 확인해 주세요.");
+  }
+
+  /** Watches are refreshed server-side; opening the notification pane is not required. */
+  @Scheduled(initialDelayString="PT3H",fixedDelayString="PT3H")
+  public void refreshTodaysWatchedFlights(){
+    if(!live())return;String date=LocalDate.now(SEOUL).toString();
+    List<String> directions=db.query("SELECT DISTINCT direction FROM watches WHERE scheduled_date=?",(rs,row)->rs.getString(1),date);
+    for(String direction:directions){try{liveFlights(date,"",normalizedDirection(direction));}catch(Exception e){LOG.warn("scheduled_watch_refresh_failed date={} direction={}",date,direction,e);}}
+  }
+
   @SuppressWarnings("unchecked") private Map<String,Object> readCache(String key){try{String value=redis.opsForValue().get(key);return value==null?null:json.readValue(value,new TypeReference<Map<String,Object>>(){});}catch(Exception e){return null;}}
   private void writeCache(String key,Map<String,Object> value){try{redis.opsForValue().set(key,toJson(value),Duration.ofMinutes(15));}catch(Exception e){LOG.warn("flight_cache_write_failed key={}",key);}}
+  @SuppressWarnings("unchecked") private Map<String,Object> withFreshness(Map<String,Object> base){
+    Map<String,Object> out=new LinkedHashMap<>(base);Map<String,Object> source=new LinkedHashMap<>((Map<String,Object>)base.getOrDefault("source",Map.of()));Instant observed=parseInstant(source.get("lastSuccessfulCollectionAt"),Instant.EPOCH);long age=Math.max(0,Duration.between(observed,Instant.now()).toSeconds());source.put("ageSeconds",age);source.put("freshness",age<=900?"FRESH":age<=21600?"STALE":"OLD");out.put("source",source);return out;
+  }
   @SuppressWarnings("unchecked") private Map<String,Object> filter(Map<String,Object> base,String query){
     if(query==null||query.isBlank())return base;String normalized=normalize(query);
     List<Map<String,Object>> items=((List<Map<String,Object>>)base.get("items")).stream().filter(item->matches(item,normalized)).toList();
@@ -166,8 +195,9 @@ public class Application {
 
   @PostMapping("/meetups") @ResponseStatus(HttpStatus.CREATED)
   public Meetup createMeetup(@Valid @RequestBody CreateMeetupRequest body,HttpServletRequest request,HttpServletResponse response){
-    String direction=normalizedDirection(body.direction());LocalDate.parse(body.scheduledDate());Map<String,Object> flight=verifiedFlight(body.providerId(),body.scheduledDate(),direction);
-    String owner=owner(request,response),id=UUID.randomUUID().toString();Instant now=Instant.now();
+    String direction=normalizedDirection(body.direction());if(!"ARRIVAL".equals(direction))throw new Bad("마중방은 인천 도착편에서만 만들 수 있어요.");LocalDate.parse(body.scheduledDate());Map<String,Object> flight=verifiedFlight(body.providerId(),body.scheduledDate(),direction);
+    String owner=owner(request,response);List<Meetup> existing=db.query(meetupSelect()+" WHERE owner_hash=? AND provider_id=? AND direction=? AND completed=FALSE",this::mapMeetup,owner,body.providerId(),direction);if(!existing.isEmpty())return existing.getFirst();
+    String id=UUID.randomUUID().toString();Instant now=Instant.now();
     db.update("INSERT INTO meetups (id,owner_hash,revision,flight,origin,destination,scheduled,estimated,scheduled_date,terminal,arrival_exit,baggage,traveler_status,note,point_terminal,point_area,point_exit,point_landmark,completed,updated_at,provider_id,direction,source_observed_at,traveler_updated_at,meeting_updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         id,owner,1,text(flight,"displayNumber"),text(flight,"origin"),text(flight,"destination"),text(flight,"scheduledLocalTime"),text(flight,"estimatedLocalTime"),body.scheduledDate(),text(flight,"terminalDisplayName"),text(flight,"arrivalExit"),text(flight,"baggageCarousel"),"NOT_SHARED","","","","","",false,now,body.providerId(),direction,parseInstant(flight.get("observedAt"),now),now,now);
     return requireMeetup(id);
@@ -179,20 +209,22 @@ public class Application {
   }
   @GetMapping("/meetups/{id}") public Meetup meetup(@PathVariable String id,HttpServletRequest request,HttpServletResponse response){noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);refreshMeetupFromCache(meetup);return requireMeetup(id);}
   @PatchMapping("/meetups/{id}/traveler-status") public Meetup status(@PathVariable String id,@Valid @RequestBody StatusRequest body,HttpServletRequest request,HttpServletResponse response){
-    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);if(!TRAVELER_STATES.contains(body.status()))throw new Bad("여행자 상태가 올바르지 않아요.");Instant now=Instant.now();
+    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);active(meetup);if(!TRAVELER_STATES.contains(body.status())||"MET".equals(body.status()))throw new Bad("여행자 상태가 올바르지 않아요.");Instant now=Instant.now();
     update(id,body.expectedVersion(),"UPDATE meetups SET traveler_status=?,traveler_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",body.status(),now,now);return requireMeetup(id);
   }
   @PatchMapping("/meetups/{id}/meeting-note") public Meetup note(@PathVariable String id,@Valid @RequestBody NoteRequest body,HttpServletRequest request,HttpServletResponse response){
-    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);Instant now=Instant.now();update(id,body.expectedVersion(),"UPDATE meetups SET note=?,meeting_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",body.text(),now,now);return requireMeetup(id);
+    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);active(meetup);Instant now=Instant.now();update(id,body.expectedVersion(),"UPDATE meetups SET note=?,meeting_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",body.text(),now,now);return requireMeetup(id);
   }
   @PatchMapping("/meetups/{id}/meeting-point") public Meetup point(@PathVariable String id,@Valid @RequestBody MeetingPointRequest body,HttpServletRequest request,HttpServletResponse response){
-    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);Instant now=Instant.now();update(id,body.expectedVersion(),"UPDATE meetups SET point_terminal=?,point_area=?,point_exit=?,point_landmark=?,note=?,meeting_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",body.terminal(),body.publicArea(),body.exitLabel(),body.landmark(),body.note(),now,now);return requireMeetup(id);
+    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);active(meetup);Instant now=Instant.now();update(id,body.expectedVersion(),"UPDATE meetups SET point_terminal=?,point_area=?,point_exit=?,point_landmark=?,note=?,meeting_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",trim(body.terminal()),trim(body.publicArea()),trim(body.exitLabel()),trim(body.landmark()),trim(body.note()),now,now);return requireMeetup(id);
   }
+  @Transactional
   @PostMapping("/meetups/{id}/complete") public Meetup complete(@PathVariable String id,@Valid @RequestBody CompleteRequest body,HttpServletRequest request,HttpServletResponse response){
-    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);synchronized(writeLock){Instant now=Instant.now();update(id,body.expectedVersion(),"UPDATE meetups SET traveler_status='MET',completed=TRUE,traveler_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",now,now);db.update("UPDATE shares SET revoked=TRUE WHERE meetup_id=?",id);}return requireMeetup(id);
+    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);active(meetup);Instant now=Instant.now();update(id,body.expectedVersion(),"UPDATE meetups SET traveler_status='MET',completed=TRUE,traveler_updated_at=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",now,now);db.update("UPDATE shares SET revoked=TRUE WHERE meetup_id=?",id);return requireMeetup(id);
   }
+  @Transactional
   @PostMapping("/meetups/{id}/shares") @ResponseStatus(HttpStatus.CREATED) public Map<String,Object> share(@PathVariable String id,HttpServletRequest request,HttpServletResponse response){
-    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);if(meetup.completed)throw new Gone("완료된 마중방이에요.");byte[] bytes=new byte[32];random.nextBytes(bytes);String token=Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);Instant expiry=Instant.now().plus(Duration.ofHours(24));db.update("INSERT INTO shares VALUES (?,?,?,?,?)",hash(token),id,expiry,false,Instant.now());return Map.of("url","/majoong/s#token="+token,"expiresAt",expiry.toString(),"scope","항공편·공식 공항 정보·여행자가 입력한 상태와 만남 장소");
+    noStore(response);Meetup meetup=requireMeetup(id);own(meetup,request);active(meetup);byte[] bytes=new byte[32];random.nextBytes(bytes);String token=Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);Instant expiry=Instant.now().plus(Duration.ofHours(24));db.update("UPDATE shares SET revoked=TRUE WHERE meetup_id=? AND revoked=FALSE",id);db.update("INSERT INTO shares VALUES (?,?,?,?,?)",hash(token),id,expiry,false,Instant.now());return Map.of("url","/majoong/s#token="+token,"expiresAt",expiry.toString(),"scope","항공편·공식 공항 정보·여행자가 입력한 상태와 만남 장소");
   }
   @PostMapping("/shares/exchange") public Map<String,Object> exchange(@Valid @RequestBody TokenRequest body,HttpServletResponse response){
     noStore(response);try{Share share=db.queryForObject("SELECT token_hash,meetup_id,expires_at,revoked FROM shares WHERE token_hash=?",(rs,row)->new Share(rs.getString(1),rs.getString(2),rs.getObject(3,Instant.class),rs.getBoolean(4)),hash(body.token()));Meetup meetup=requireMeetup(share.meetup);if(share.revoked||share.expiry.isBefore(Instant.now())||meetup.completed)throw new Gone("공유가 종료됐어요.");refreshMeetupFromCache(meetup);return shared(requireMeetup(share.meetup));}catch(EmptyResultDataAccessException e){throw new Gone("공유가 종료됐어요.");}
@@ -202,8 +234,8 @@ public class Application {
     String owner=owner(request,response);TripRequest normalized=normalizeTrip(body);validateTrip(normalized);String id=UUID.randomUUID().toString();Instant now=Instant.now();
     db.update("INSERT INTO trips (id,owner_hash,trip_type,name,segments_json,state,created_at,revision,updated_at,deleted) VALUES (?,?,?,?,?,?,?,?,?,FALSE)",id,owner,normalized.type(),normalized.name(),toJson(normalized.segments()),tripState(normalized.segments()),now,1,now);tripWrites.increment();return requireTrip(id,owner);
   }
-  @GetMapping("/trips") public List<Map<String,Object>> trips(HttpServletRequest request,HttpServletResponse response){
-    noStore(response);String owner=existingOwner(request);if(owner==null)return List.of();return db.query("SELECT id,trip_type,name,segments_json,state,created_at,revision,updated_at FROM trips WHERE owner_hash=? AND deleted=FALSE ORDER BY updated_at DESC",(rs,row)->tripMap(rs.getString(1),rs.getString(2),rs.getString(3),rs.getString(4),rs.getString(5),rs.getObject(6,Instant.class),rs.getLong(7),rs.getObject(8,Instant.class)),owner);
+  @GetMapping("/trips") public List<Map<String,Object>> trips(@RequestParam(defaultValue="active") String state,HttpServletRequest request,HttpServletResponse response){
+    noStore(response);String owner=existingOwner(request);if(owner==null)return List.of();boolean deleted="trash".equalsIgnoreCase(state);if(!deleted&&!"active".equalsIgnoreCase(state))throw new Bad("여정 목록 상태를 확인해 주세요.");return db.query("SELECT id,trip_type,name,segments_json,state,created_at,revision,updated_at,deleted_at,purge_at FROM trips WHERE owner_hash=? AND deleted=? ORDER BY updated_at DESC",(rs,row)->tripMap(rs.getString(1),rs.getString(2),rs.getString(3),rs.getString(4),rs.getString(5),rs.getObject(6,Instant.class),rs.getLong(7),rs.getObject(8,Instant.class),rs.getObject(9,Instant.class),rs.getObject(10,Instant.class)),owner,deleted);
   }
   @GetMapping("/trips/{id}") public Map<String,Object> trip(@PathVariable String id,HttpServletRequest request,HttpServletResponse response){noStore(response);String owner=existingOwner(request);if(owner==null)throw new Missing("여정을 찾을 수 없어요.");return requireTrip(id,owner);}
   @PatchMapping("/trips/{id}") public Map<String,Object> updateTrip(@PathVariable String id,@Valid @RequestBody TripRequest body,HttpServletRequest request,HttpServletResponse response){
@@ -211,7 +243,8 @@ public class Application {
     int changed=db.update("UPDATE trips SET trip_type=?,name=?,segments_json=?,state=?,revision=revision+1,updated_at=? WHERE id=? AND owner_hash=? AND revision=? AND deleted=FALSE",normalized.type(),normalized.name(),toJson(normalized.segments()),tripState(normalized.segments()),Instant.now(),id,owner,body.expectedRevision());
     if(changed!=1)throw new Conflict("다른 화면에서 여정이 수정됐어요. 다시 불러와 주세요.");tripWrites.increment();return requireTrip(id,owner);
   }
-  @DeleteMapping("/trips/{id}") @ResponseStatus(HttpStatus.NO_CONTENT) public void deleteTrip(@PathVariable String id,HttpServletRequest request,HttpServletResponse response){noStore(response);String owner=existingOwner(request);if(owner==null||db.update("UPDATE trips SET deleted=TRUE,updated_at=? WHERE id=? AND owner_hash=? AND deleted=FALSE",Instant.now(),id,owner)!=1)throw new Missing("여정을 찾을 수 없어요.");}
+  @DeleteMapping("/trips/{id}") @ResponseStatus(HttpStatus.NO_CONTENT) public void deleteTrip(@PathVariable String id,HttpServletRequest request,HttpServletResponse response){noStore(response);String owner=existingOwner(request);Instant now=Instant.now();if(owner==null||db.update("UPDATE trips SET deleted=TRUE,deleted_at=?,purge_at=?,updated_at=? WHERE id=? AND owner_hash=? AND deleted=FALSE",now,now.plus(Duration.ofDays(7)),now,id,owner)!=1)throw new Missing("여정을 찾을 수 없어요.");}
+  @PostMapping("/trips/{id}/restore") public Map<String,Object> restoreTrip(@PathVariable String id,HttpServletRequest request,HttpServletResponse response){noStore(response);String owner=existingOwner(request);Instant now=Instant.now();if(owner==null)throw new Missing("여정을 찾을 수 없어요.");int changed=db.update("UPDATE trips SET deleted=FALSE,deleted_at=NULL,purge_at=NULL,revision=revision+1,updated_at=? WHERE id=? AND owner_hash=? AND deleted=TRUE AND purge_at>?",now,id,owner,now);if(changed!=1)throw new Gone("복원 가능한 기간이 지났거나 여정을 찾을 수 없어요.");return requireTrip(id,owner);}
 
   @PostMapping("/watches") @ResponseStatus(HttpStatus.CREATED) public Map<String,Object> createWatch(@Valid @RequestBody WatchRequest body,HttpServletRequest request,HttpServletResponse response){
     String direction=normalizedDirection(body.direction());Map<String,Object> flight=verifiedFlight(body.providerId(),body.scheduledDate(),direction);String owner=owner(request,response),id=UUID.randomUUID().toString();Instant now=Instant.now();
@@ -233,15 +266,30 @@ public class Application {
   @SuppressWarnings("unchecked") private Map<String,Object> verifiedFlight(String providerId,String date,String direction){if(providerId==null||providerId.isBlank())throw new Bad("항공편 식별값이 필요해요.");Map<String,Object> result=liveFlights(date,"",direction);return ((List<Map<String,Object>>)result.getOrDefault("items",List.of())).stream().filter(item->providerId.equals(text(item,"id"))).findFirst().orElseThrow(()->new Missing("선택한 항공편을 다시 확인해 주세요."));}
   private void refreshMeetupFromCache(Meetup meetup){if(meetup.providerId.isBlank())return;Map<String,Object> cached=readCache("majoong:flights:"+meetup.scheduledDate+":"+meetup.direction);if(cached==null)return;@SuppressWarnings("unchecked") List<Map<String,Object>> items=(List<Map<String,Object>>)cached.getOrDefault("items",List.of());items.stream().filter(item->meetup.providerId.equals(text(item,"id"))).findFirst().ifPresent(item->db.update("UPDATE meetups SET scheduled=?,estimated=?,terminal=?,arrival_exit=?,baggage=?,source_observed_at=? WHERE id=?",text(item,"scheduledLocalTime"),text(item,"estimatedLocalTime"),text(item,"terminalDisplayName"),text(item,"arrivalExit"),text(item,"baggageCarousel"),parseInstant(item.get("observedAt"),meetup.sourceObservedAt),meetup.id));}
 
-  private TripRequest normalizeTrip(TripRequest request){List<TripSegment> segments=new ArrayList<>();for(TripSegment segment:request.segments())segments.add(new TripSegment(firstNonBlank(segment.segmentId(),UUID.randomUUID().toString()),normalize(segment.flightNumber()),segment.date(),firstNonBlank(segment.dateBasis(),"DEPARTURE_LOCAL_DATE"),normalize(segment.origin()),normalize(segment.destination()),trim(segment.airline()),trim(segment.bookingReference()).toUpperCase(Locale.ROOT),trim(segment.departureTime()),trim(segment.arrivalTime()),trim(segment.terminal()),trim(segment.gate()),trim(segment.seat()).toUpperCase(Locale.ROOT),trim(segment.baggage()),trim(segment.memo()),trim(segment.providerId()),trim(segment.direction()).toUpperCase(Locale.ROOT),trim(segment.sourceState())));return new TripRequest(request.type().toUpperCase(Locale.ROOT),request.name().trim(),segments,request.expectedRevision());}
+  private TripRequest normalizeTrip(TripRequest request){
+    List<TripSegment> segments=new ArrayList<>();
+    for(TripSegment segment:request.segments()){
+      String date=trim(segment.date()),origin=normalize(segment.origin()),destination=normalize(segment.destination()),direction=trim(segment.direction()).toUpperCase(Locale.ROOT),providerId=trim(segment.providerId());
+      if(!DIRECTIONS.contains(direction))direction="";
+      String sourceState="MANUAL_UNVERIFIED";
+      if(!providerId.isBlank()&&!direction.isBlank()&&officialFlightMatches(providerId,date,direction,origin,destination))sourceState="OFFICIAL_LINKED";
+      else providerId="";
+      segments.add(new TripSegment(firstNonBlank(segment.segmentId(),UUID.randomUUID().toString()),normalize(segment.flightNumber()),date,firstNonBlank(segment.dateBasis(),"DEPARTURE_LOCAL_DATE"),origin,destination,trim(segment.airline()),trim(segment.bookingReference()).toUpperCase(Locale.ROOT),trim(segment.departureTime()),trim(segment.arrivalTime()),trim(segment.terminal()),trim(segment.gate()),trim(segment.seat()).toUpperCase(Locale.ROOT),trim(segment.baggage()),trim(segment.memo()),providerId,direction,sourceState));
+    }
+    return new TripRequest(request.type().toUpperCase(Locale.ROOT),request.name().trim(),segments,request.expectedRevision());
+  }
+  @SuppressWarnings("unchecked") private boolean officialFlightMatches(String providerId,String date,String direction,String origin,String destination){
+    Map<String,Object> cached=readCache("majoong:flights:"+date+":"+direction);if(cached==null)return false;
+    return ((List<Map<String,Object>>)cached.getOrDefault("items",List.of())).stream().anyMatch(item->providerId.equals(text(item,"id"))&&origin.equals(text(item,"origin"))&&destination.equals(text(item,"destination")));
+  }
   private void validateTrip(TripRequest request){
     if(!TRIP_TYPES.contains(request.type()))throw new Bad("여정 유형이 올바르지 않아요.");if(request.type().equals("ONE_WAY")&&request.segments().size()!=1)throw new Bad("편도는 한 구간만 등록할 수 있어요.");if(request.type().equals("ROUND_TRIP")&&request.segments().size()!=2)throw new Bad("왕복은 가는 편과 오는 편 두 구간이 필요해요.");if(request.type().equals("MULTI_CITY")&&request.segments().size()<2)throw new Bad("다구간은 두 구간 이상이 필요해요.");LocalDate previous=null;
     for(TripSegment segment:request.segments()){if(!segment.origin().matches("[A-Z]{3}")||!segment.destination().matches("[A-Z]{3}"))throw new Bad("출발·도착 공항은 3자리 IATA 코드로 입력해 주세요.");if(segment.origin().equals(segment.destination()))throw new Bad("출발 공항과 도착 공항은 달라야 해요.");LocalDate current;try{current=LocalDate.parse(segment.date());}catch(Exception e){throw new Bad("여정 날짜를 확인해 주세요.");}if(previous!=null&&current.isBefore(previous))throw new Bad("여정 날짜는 시간순으로 입력해 주세요.");previous=current;}
     if(request.type().equals("ROUND_TRIP")&&(!request.segments().get(0).destination().equals(request.segments().get(1).origin())||!request.segments().get(0).origin().equals(request.segments().get(1).destination())))throw new Bad("왕복의 출발·도착 공항이 서로 맞지 않아요.");
   }
-  private String tripState(List<TripSegment> segments){return segments.stream().allMatch(segment->!segment.providerId().isBlank())?"OFFICIAL_LINKED":"MANUAL_UNVERIFIED";}
-  private Map<String,Object> requireTrip(String id,String owner){try{return db.queryForObject("SELECT id,trip_type,name,segments_json,state,created_at,revision,updated_at FROM trips WHERE id=? AND owner_hash=? AND deleted=FALSE",(rs,row)->tripMap(rs.getString(1),rs.getString(2),rs.getString(3),rs.getString(4),rs.getString(5),rs.getObject(6,Instant.class),rs.getLong(7),rs.getObject(8,Instant.class)),id,owner);}catch(EmptyResultDataAccessException e){throw new Missing("여정을 찾을 수 없어요.");}}
-  private Map<String,Object> tripMap(String id,String type,String name,String segments,String state,Instant createdAt,long revision,Instant updatedAt){return Map.of("id",id,"type",type,"name",name,"segments",readSegments(segments),"state",state,"revision",revision,"createdAt",createdAt.toString(),"updatedAt",updatedAt.toString());}
+  private String tripState(List<TripSegment> segments){return segments.stream().allMatch(segment->"OFFICIAL_LINKED".equals(segment.sourceState()))?"OFFICIAL_LINKED":"MANUAL_UNVERIFIED";}
+  private Map<String,Object> requireTrip(String id,String owner){try{return db.queryForObject("SELECT id,trip_type,name,segments_json,state,created_at,revision,updated_at,deleted_at,purge_at FROM trips WHERE id=? AND owner_hash=? AND deleted=FALSE",(rs,row)->tripMap(rs.getString(1),rs.getString(2),rs.getString(3),rs.getString(4),rs.getString(5),rs.getObject(6,Instant.class),rs.getLong(7),rs.getObject(8,Instant.class),rs.getObject(9,Instant.class),rs.getObject(10,Instant.class)),id,owner);}catch(EmptyResultDataAccessException e){throw new Missing("여정을 찾을 수 없어요.");}}
+  private Map<String,Object> tripMap(String id,String type,String name,String segments,String state,Instant createdAt,long revision,Instant updatedAt,Instant deletedAt,Instant purgeAt){return linkedMap("id",id,"type",type,"name",name,"segments",readSegments(segments),"state",state,"revision",revision,"createdAt",createdAt.toString(),"updatedAt",updatedAt.toString(),"deletedAt",deletedAt==null?null:deletedAt.toString(),"purgeAt",purgeAt==null?null:purgeAt.toString());}
   private Object readSegments(String value){try{return json.readValue(value,Object.class);}catch(Exception e){throw new IllegalStateException("저장된 일정 형식을 읽을 수 없어요.");}}
 
   private Map<String,Object> shared(Meetup meetup){return linkedMap("meetupId",meetup.id,"revision",meetup.revision,"flight",Map.of("displayNumber",meetup.flight,"origin",meetup.origin,"destination",meetup.destination),"arrival",Map.of("scheduledLocalTime",meetup.scheduled,"estimatedLocalTime",meetup.estimated,"date",meetup.scheduledDate,"zoneId","Asia/Seoul"),"airportInfo",Map.of("terminal",meetup.terminal,"arrivalExit",meetup.exit,"baggageCarousel",meetup.baggage),"traveler",Map.of("status",meetup.status,"updatedAt",meetup.travelerUpdatedAt.toString()),"meetingPoint",Map.of("terminal",meetup.pointTerminal,"publicArea",meetup.pointArea,"exitLabel",meetup.pointExit,"landmark",meetup.pointLandmark,"sourceType",meetup.pointTerminal.isBlank()?"NONE":"USER_CONFIRMED"),"meetingNote",meetup.note,"officialDataState",meetup.providerId.isBlank()?"SNAPSHOT_AT_CREATION":"CACHE_REFRESHED","sourceObservedAt",meetup.sourceObservedAt.toString(),"meetingUpdatedAt",meetup.meetingUpdatedAt.toString());}
@@ -249,6 +297,7 @@ public class Application {
   private Meetup mapMeetup(java.sql.ResultSet rs,int row)throws java.sql.SQLException{return new Meetup(rs.getString(1),rs.getString(2),rs.getLong(3),rs.getString(4),rs.getString(5),rs.getString(6),rs.getString(7),rs.getString(8),rs.getString(9),rs.getString(10),rs.getString(11),rs.getString(12),rs.getString(13),rs.getString(14),rs.getString(15),rs.getString(16),rs.getString(17),rs.getString(18),rs.getBoolean(19),rs.getObject(20,Instant.class),rs.getString(21),rs.getString(22),rs.getObject(23,Instant.class),rs.getObject(24,Instant.class),rs.getObject(25,Instant.class));}
   private Meetup requireMeetup(String id){try{return db.queryForObject(meetupSelect()+" WHERE id=?",this::mapMeetup,id);}catch(EmptyResultDataAccessException e){throw new Missing("마중방을 찾을 수 없어요.");}}
   private void own(Meetup meetup,HttpServletRequest request){String owner=existingOwner(request);if(owner==null||!MessageDigest.isEqual(meetup.ownerHash.getBytes(StandardCharsets.UTF_8),owner.getBytes(StandardCharsets.UTF_8)))throw new Missing("마중방을 찾을 수 없어요.");}
+  private void active(Meetup meetup){if(meetup.completed)throw new Gone("완료된 마중방이에요.");}
 
   private String owner(HttpServletRequest request,HttpServletResponse response){String value=cookie(request);if(value==null){byte[] bytes=new byte[32];random.nextBytes(bytes);value=Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);response.addHeader(HttpHeaders.SET_COOKIE,ResponseCookie.from(OWNER_COOKIE,value).httpOnly(true).secure(true).sameSite("Strict").path("/majoong/").maxAge(Duration.ofDays(90)).build().toString());}return hash(value);}
   private String existingOwner(HttpServletRequest request){String token=cookie(request);return token==null?null:hash(token);}private String cookie(HttpServletRequest request){var cookie=WebUtils.getCookie(request,OWNER_COOKIE);return cookie==null?null:cookie.getValue();}
@@ -277,7 +326,7 @@ public class Application {
     Meetup(String id,String ownerHash,long revision,String flight,String origin,String destination,String scheduled,String estimated,String scheduledDate,String terminal,String exit,String baggage,String status,String note,String pointTerminal,String pointArea,String pointExit,String pointLandmark,boolean completed,Instant updatedAt,String providerId,String direction,Instant sourceObservedAt,Instant travelerUpdatedAt,Instant meetingUpdatedAt){this.id=id;this.ownerHash=ownerHash;this.revision=revision;this.flight=flight;this.origin=origin;this.destination=destination;this.scheduled=scheduled;this.estimated=estimated;this.scheduledDate=scheduledDate;this.terminal=terminal;this.exit=exit;this.baggage=baggage;this.status=status;this.note=note;this.pointTerminal=pointTerminal;this.pointArea=pointArea;this.pointExit=pointExit;this.pointLandmark=pointLandmark;this.completed=completed;this.updatedAt=updatedAt;this.providerId=providerId;this.direction=direction;this.sourceObservedAt=sourceObservedAt;this.travelerUpdatedAt=travelerUpdatedAt;this.meetingUpdatedAt=meetingUpdatedAt;}
   }
   record FlightRow(String id,String number,String schedule,String estimated,String airportCode,String airportName,String terminal,String exit,String baggage,String status){}record JsonNodeResult(int total,List<FlightRow> rows,int pages,boolean partial){}record Share(String tokenHash,String meetup,Instant expiry,boolean revoked){}
-  record CreateMeetupRequest(@NotBlank String providerId,@NotBlank @Pattern(regexp="\\d{4}-\\d{2}-\\d{2}") String scheduledDate,@NotBlank String direction){}record StatusRequest(@NotBlank String status,@PositiveOrZero long expectedVersion){}record NoteRequest(@NotBlank @Size(max=300) String text,@PositiveOrZero long expectedVersion){}record MeetingPointRequest(@NotBlank @Size(max=160) String terminal,@NotBlank @Size(max=120) String publicArea,@NotBlank @Size(max=40) String exitLabel,@NotBlank @Size(max=160) String landmark,@NotBlank @Size(max=300) String note,@PositiveOrZero long expectedVersion){}record CompleteRequest(@PositiveOrZero long expectedVersion){}record TokenRequest(@NotBlank @Size(max=128) String token){}record WatchRequest(@NotBlank String providerId,@NotBlank @Pattern(regexp="\\d{4}-\\d{2}-\\d{2}") String scheduledDate,@NotBlank String direction){}
+  record CreateMeetupRequest(@NotBlank String providerId,@NotBlank @Pattern(regexp="\\d{4}-\\d{2}-\\d{2}") String scheduledDate,@NotBlank String direction){}record StatusRequest(@NotBlank String status,@PositiveOrZero long expectedVersion){}record NoteRequest(@NotBlank @Size(max=300) String text,@PositiveOrZero long expectedVersion){}record MeetingPointRequest(@Size(max=160) String terminal,@Size(max=120) String publicArea,@Size(max=40) String exitLabel,@Size(max=160) String landmark,@Size(max=300) String note,@PositiveOrZero long expectedVersion){}record CompleteRequest(@PositiveOrZero long expectedVersion){}record TokenRequest(@NotBlank @Size(max=128) String token){}record WatchRequest(@NotBlank String providerId,@NotBlank @Pattern(regexp="\\d{4}-\\d{2}-\\d{2}") String scheduledDate,@NotBlank String direction){}
   record TripSegment(String segmentId,@Size(max=20) String flightNumber,@NotBlank @Pattern(regexp="\\d{4}-\\d{2}-\\d{2}") String date,String dateBasis,@NotBlank String origin,@NotBlank String destination,@Size(max=80) String airline,@Size(max=40) String bookingReference,@Size(max=5) String departureTime,@Size(max=5) String arrivalTime,@Size(max=40) String terminal,@Size(max=20) String gate,@Size(max=20) String seat,@Size(max=80) String baggage,@Size(max=300) String memo,String providerId,String direction,String sourceState){}record TripRequest(@NotBlank String type,@NotBlank @Size(max=120) String name,@NotEmpty List<@Valid TripSegment> segments,Long expectedRevision){}
   static class Bad extends RuntimeException{Bad(String message){super(message);}}static class DateOutOfRange extends RuntimeException{DateOutOfRange(String message){super(message);}}static class Missing extends RuntimeException{Missing(String message){super(message);}}static class Conflict extends RuntimeException{Conflict(String message){super(message);}}static class Gone extends RuntimeException{Gone(String message){super(message);}}static class SourceUnavailable extends RuntimeException{SourceUnavailable(String message){super(message);}}
 }
