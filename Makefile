@@ -2,10 +2,10 @@
 test:
 	mvn test
 images:
-	sudo docker build -t majoong/journey-service:0.6.0 .
-	sudo docker build -t majoong/web:0.6.0 web
-	sudo docker save majoong/journey-service:0.6.0 | sudo ctr -n k8s.io images import -
-	sudo docker save majoong/web:0.6.0 | sudo ctr -n k8s.io images import -
+	sudo docker build -t majoong/journey-service:0.6.1 .
+	sudo docker build -t majoong/web:0.6.1 web
+	sudo docker save majoong/journey-service:0.6.1 | sudo ctr -n k8s.io images import -
+	sudo docker save majoong/web:0.6.1 | sudo ctr -n k8s.io images import -
 deploy:
 	kubectl apply -f deploy/k8s/majoong.yaml
 	sudo install -m 644 deploy/k8s/majoong-proxy.conf /etc/nginx/snippets/majoong-proxy.conf

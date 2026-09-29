@@ -92,7 +92,7 @@ flowchart LR
 | 메트릭 수집 | Prometheus 3.14, kube-state-metrics 2.20, node-exporter 1.12 | Kubernetes·노드·컨테이너 상태 수집 |
 | 메트릭 대시보드 | Grafana 13.2 | 클러스터 상태·자원·재시작·경고 시각화 |
 
-현재 배포 이미지 태그는 `majoong/journey-service:0.6.0`, `majoong/web:0.6.0`입니다.
+현재 배포 이미지 태그는 `majoong/journey-service:0.6.1`, `majoong/web:0.6.1`입니다.
 
 ## 배포 구성과 운영
 
